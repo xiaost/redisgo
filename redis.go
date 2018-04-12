@@ -6,6 +6,7 @@ import (
 	"strconv"
 	"sync"
 	"time"
+	"unsafe"
 )
 
 // Redis represents a redis client
@@ -180,13 +181,15 @@ func (c *Redis) read(r *Reply) (err error) {
 		err = errProtocol
 		return
 	}
+	t := b[0]
+	b = b[1:]
 	var n int // for strlen or arraylen
-	switch b[0] {
+	switch t {
 	case '+': // Simple Strings
-		r.b = b[1:]
+		r.b = b
 		r.t = replySString
 	case '$': // Bulk Strings
-		n, err = strconv.Atoi(ss(b[1:]))
+		n, err = strconv.Atoi(ss(b))
 		if err != nil {
 			return
 		}
@@ -201,12 +204,12 @@ func (c *Redis) read(r *Reply) (err error) {
 		r.b = r.b[:n]
 		r.t = replyBString
 	case ':': // Integers
-		r.i, err = strconv.ParseInt(ss(b[1:]), 10, 64)
+		r.i, err = strconv.ParseInt(ss(b), 10, 64)
 		if err == nil {
 			r.t = replyInteger
 		}
 	case '*': // Arrays
-		n, err = strconv.Atoi(ss(b[1:]))
+		n, err = strconv.Atoi(ss(b))
 		if err != nil {
 			return
 		}
@@ -226,7 +229,7 @@ func (c *Redis) read(r *Reply) (err error) {
 		}
 	case '-': // Errors
 		r.t = replyError
-		r.err = RedisErr(b[1:])
+		r.err = *(*RedisErr)(unsafe.Pointer(&b))
 	default:
 		err = errProtocol
 	}

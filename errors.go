@@ -16,4 +16,4 @@ var (
 type RedisErr string
 
 // RedisErr implements error interface
-func (err RedisErr) Error() string { return "redis: " + string(err) }
+func (err RedisErr) Error() string { return string(err) }
