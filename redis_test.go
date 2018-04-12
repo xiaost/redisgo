@@ -1,7 +1,9 @@
 package redisgo
 
 import (
+	"io"
 	"net"
+	"sync"
 	"testing"
 	"time"
 )
@@ -57,11 +59,7 @@ func TestRedis(t *testing.T) {
 }
 
 func BenchmarkCmdSet(b *testing.B) {
-	conn, err := net.Dial("tcp", "127.0.0.1:6379")
-	if err != nil {
-		b.Fatal(err)
-	}
-	defer conn.Close()
+	var conn = net.Conn(&FakeConn{reply: []byte("+OK\r\n")})
 	cli := NewRedis(conn)
 	var reply Reply
 	for i := 0; i < b.N; i++ {
@@ -73,3 +71,39 @@ func BenchmarkCmdSet(b *testing.B) {
 		}
 	}
 }
+
+type FakeConn struct {
+	mu     sync.Mutex
+	reply  []byte
+	r      int
+	closed bool
+}
+
+func (c *FakeConn) Read(b []byte) (int, error) {
+	if c.closed {
+		return 0, errClosed
+	}
+	if len(c.reply) == 0 {
+		return 0, io.EOF
+	}
+	if c.r >= len(c.reply) {
+		c.r = 0
+	}
+	n := copy(b, c.reply[c.r:])
+	c.r += n
+	return n, nil
+}
+
+type noaddr struct{}
+
+func (noaddr) Network() string { return "noaddr" }
+func (noaddr) String() string  { return "noaddr" }
+
+func (c *FakeConn) Write(b []byte) (int, error) { return len(b), nil }
+func (c *FakeConn) Close() error                { c.closed = true; return nil }
+func (c *FakeConn) LocalAddr() net.Addr         { return noaddr{} }
+func (c *FakeConn) RemoteAddr() net.Addr        { return noaddr{} }
+
+func (c *FakeConn) SetDeadline(time.Time) error      { return nil }
+func (c *FakeConn) SetReadDeadline(time.Time) error  { return nil }
+func (c *FakeConn) SetWriteDeadline(time.Time) error { return nil }
