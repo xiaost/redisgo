@@ -14,7 +14,7 @@ var (
 
 // RedisErr represents a server side err
 // https://redis.io/topics/protocol#resp-errors
-type RedisErr string
+type RedisErr []byte
 
 // RedisErr implements error interface
-func (err RedisErr) Error() string { return string(err) }
+func (err RedisErr) Error() string { return ss(err) }
