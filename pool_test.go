@@ -33,14 +33,14 @@ func TestPoolConn(t *testing.T) {
 	if p.Active() != 2 {
 		t.Fatal(p.Active())
 	}
-	p.Put(c0)
+	c0.Free()
 	if p.Idle() != 1 {
 		t.Fatal(p.Idle())
 	}
 	if p.Active() != 2 {
 		t.Fatal(p.Active())
 	}
-	p.Put(c1)
+	c1.Free()
 	if p.Idle() != 1 {
 		t.Fatal(p.Idle())
 	}
@@ -52,7 +52,7 @@ func TestPoolConn(t *testing.T) {
 		t.Fatal(c2, c0)
 	}
 	now = now.Add(3 * time.Second)
-	p.Put(c2)
+	c2.Free()
 	if p.Idle() != 0 {
 		t.Fatal(p.Idle())
 	}
@@ -60,11 +60,11 @@ func TestPoolConn(t *testing.T) {
 		t.Fatal(p.Active())
 	}
 	c0, _ = p.Get(ctx)
-	p.Put(c0)
+	c0.Free()
 	now = now.Add(2 * time.Second)
 	c1, _ = p.Get(ctx)
 	if c0 == c1 {
 		t.Fatal(c0, c1)
 	}
-	p.Put(c1)
+	c1.Free()
 }

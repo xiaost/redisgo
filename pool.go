@@ -10,6 +10,7 @@ import (
 type PoolConn struct {
 	*Conn
 
+	p         *Pool
 	freedAt   time.Time
 	createdAt time.Time
 }
@@ -17,6 +18,12 @@ type PoolConn struct {
 // CreatedAt returns the create time of the conn
 func (c *PoolConn) CreatedAt() time.Time {
 	return c.createdAt
+}
+
+// Free puts PoolConn back to the pool
+func (c *PoolConn) Free() {
+	c.p.put(c)
+	c.p = nil
 }
 
 // Pool represents a Conn pool
@@ -101,6 +108,7 @@ func (p *Pool) Get(ctx context.Context) (*PoolConn, error) {
 		now := p.nowfunc()
 		if (p.maxIdleTime > 0 && now.Sub(conn.freedAt) < p.maxIdleTime) ||
 			(p.maxConnTime > 0 && now.Sub(conn.CreatedAt()) < p.maxConnTime) {
+			conn.p = p
 			return conn, nil
 		}
 		p.closeconn(conn)
@@ -118,11 +126,10 @@ func (p *Pool) Get(ctx context.Context) (*PoolConn, error) {
 		atomic.AddInt64(&p.active, -1)
 		return nil, err
 	}
-	return &PoolConn{Conn: c, createdAt: p.nowfunc()}, nil
+	return &PoolConn{Conn: c, p: p, createdAt: p.nowfunc()}, nil
 }
 
-// Put puts conn to the pool.
-func (p *Pool) Put(conn *PoolConn) {
+func (p *Pool) put(conn *PoolConn) {
 	if conn.Err() != nil {
 		p.closeconn(conn)
 		return
@@ -142,5 +149,5 @@ func (p *Pool) Put(conn *PoolConn) {
 
 func (p *Pool) closeconn(conn *PoolConn) {
 	atomic.AddInt64(&p.active, -1)
-	conn.Close()
+	conn.Conn.Close()
 }
