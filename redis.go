@@ -4,15 +4,12 @@ import (
 	"bufio"
 	"net"
 	"strconv"
-	"sync"
 	"time"
 	"unsafe"
 )
 
-// Redis represents a redis client
-type Redis struct {
-	mu sync.RWMutex
-
+// Conn represents a redis client
+type Conn struct {
 	conn net.Conn
 	br   *reader
 	bw   *bufio.Writer
@@ -24,13 +21,13 @@ type Redis struct {
 	wtimeout time.Duration
 }
 
-// NewRedis creates Redis
-func NewRedis(conn net.Conn, ops ...Option) *Redis {
+// NewConn creates Conn
+func NewConn(conn net.Conn, ops ...Option) *Conn {
 	o := defaultoptions
 	for _, op := range ops {
 		o = op(o)
 	}
-	var r Redis
+	var r Conn
 	r.conn = conn
 	r.br = newReader(conn, o.rbuf)
 	r.bw = bufio.NewWriterSize(conn, o.wbuf)
@@ -40,28 +37,24 @@ func NewRedis(conn net.Conn, ops ...Option) *Redis {
 }
 
 // SetReadTimeout sets the read timeout of underlying connection
-func (c *Redis) SetReadTimeout(t time.Duration) {
-	c.mu.Lock()
+func (c *Conn) SetReadTimeout(t time.Duration) {
 	c.rtimeout = t
-	c.mu.Unlock()
 }
 
 // SetWriteTimeout sets the write timeout of underlying connection
-func (c *Redis) SetWriteTimeout(t time.Duration) {
-	c.mu.Lock()
+func (c *Conn) SetWriteTimeout(t time.Duration) {
 	c.wtimeout = t
-	c.mu.Unlock()
 }
 
 // SetTimeout sets the read and write timeouts of underlying connection
-func (c *Redis) SetTimeout(t time.Duration) {
+func (c *Conn) SetTimeout(t time.Duration) {
 	c.SetReadTimeout(t)
 	c.SetWriteTimeout(t)
 }
 
-// Do sends command to redis and recv reply
+// Do sends command to redis and recv reply.
 // Reply.Free() SHOULD be called when no longer used
-func (c *Redis) Do(cmd string, args ...interface{}) (*Reply, error) {
+func (c *Conn) Do(cmd string, args ...interface{}) (*Reply, error) {
 	if err := c.Send(cmd, args...); err != nil {
 		return nil, err
 	}
@@ -74,31 +67,29 @@ func (c *Redis) Do(cmd string, args ...interface{}) (*Reply, error) {
 }
 
 // Send sends command to redis
-func (c *Redis) Send(cmd string, args ...interface{}) (err error) {
+func (c *Conn) Send(cmd string, args ...interface{}) (err error) {
 	if err = c.Err(); err != nil {
 		return
 	}
 	for _, a := range args {
 		if !validarg(a) {
-			c.mu.Lock()
-			defer c.mu.Unlock()
 			return c.seterr(errInvalidArgType)
 		}
 	}
-	cc := commandPool.Get().(*command)
-	defer commandPool.Put(cc)
-	c.mu.Lock()
-	defer c.mu.Unlock()
 	if c.wtimeout > 0 {
 		c.conn.SetWriteDeadline(time.Now().Add(c.wtimeout))
 	}
-	return c.seterr(cc.Reset(cmd).Args(args...).Dump(c.bw))
+	cc := commandPool.Get().(*command)
+	err = c.seterr(cc.Reset(cmd).Args(args...).Dump(c.bw))
+	commandPool.Put(cc)
+	return
 }
 
 // Flush writes any buffered data to redis
-func (c *Redis) Flush() error {
-	c.mu.Lock()
-	defer c.mu.Unlock()
+func (c *Conn) Flush() error {
+	if c.bw.Buffered() == 0 {
+		return nil
+	}
 	if c.wtimeout > 0 {
 		c.conn.SetWriteDeadline(time.Now().Add(c.wtimeout))
 	}
@@ -106,13 +97,11 @@ func (c *Redis) Flush() error {
 }
 
 // Recv receives reply from redis
-func (c *Redis) Recv(reply *Reply) (err error) {
+func (c *Conn) Recv(reply *Reply) (err error) {
 	reply.Reset()
 	if err = c.Err(); err != nil {
 		return
 	}
-	c.mu.Lock()
-	defer c.mu.Unlock()
 	if c.bw.Buffered() > 0 {
 		if c.wtimeout > 0 {
 			c.conn.SetWriteDeadline(time.Now().Add(c.wtimeout))
@@ -129,15 +118,13 @@ func (c *Redis) Recv(reply *Reply) (err error) {
 }
 
 // Conn returns the underlying net.Conn
-func (c *Redis) Conn() net.Conn {
+func (c *Conn) Conn() net.Conn {
 	return c.conn
 }
 
 // Close closes the underlying connection
-func (c *Redis) Close() error {
+func (c *Conn) Close() error {
 	c.Flush()
-	c.mu.Lock()
-	defer c.mu.Unlock()
 	if c.closed {
 		return errClosed
 	}
@@ -148,20 +135,20 @@ func (c *Redis) Close() error {
 	return c.conn.Close()
 }
 
-// Err returns last fatal err
+// Err returns last fatal err.
 // if not nil, caller must not reuse the instance
-func (c *Redis) Err() error {
-	c.mu.RLock()
-	defer c.mu.RUnlock()
+func (c *Conn) Err() error {
 	return c.err
 }
 
-func (c *Redis) seterr(err error) error {
+func (c *Conn) seterr(err error) error {
 	if err == nil {
 		return nil
 	}
 	if c.err == nil {
 		c.err = err
+	} else {
+		err = c.err
 	}
 	if !c.closed {
 		c.closed = true
@@ -170,7 +157,7 @@ func (c *Redis) seterr(err error) error {
 	return err
 }
 
-func (c *Redis) read(r *Reply) (err error) {
+func (c *Conn) read(r *Reply) (err error) {
 	var b []byte
 	b, err = c.br.Readline()
 	if err != nil {

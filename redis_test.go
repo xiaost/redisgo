@@ -14,7 +14,7 @@ func TestRedis(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer conn.Close()
-	cli := NewRedis(conn)
+	cli := NewConn(conn)
 	if err := cli.Send("SET", "mykey", "myvalue", "PX", 50); err != nil {
 		t.Fatal(err)
 	}
@@ -60,15 +60,19 @@ func TestRedis(t *testing.T) {
 
 func BenchmarkCmdSet(b *testing.B) {
 	var conn = net.Conn(&FakeConn{reply: []byte("+OK\r\n")})
-	cli := NewRedis(conn)
+	cli := NewConn(conn, WithReadTimeout(0), WithWriteTimeout(0))
 	var reply Reply
 	for i := 0; i < b.N; i++ {
-		if err := cli.Send("SET", "mykey", "myvalue", "PX", 50); err != nil {
+		key := "key"
+		val := "value"
+		if err := cli.Send("SET", key, val, "PX", i); err != nil {
 			b.Fatal(err)
 		}
+		cli.Flush()
 		if err := cli.Recv(&reply); err != nil {
 			b.Fatal(err)
 		}
+		_, _ = reply.Bytes()
 	}
 }
 

@@ -3,7 +3,8 @@ package redisgo
 import "errors"
 
 var (
-	ErrNil = errors.New("redisgo: nil")
+	ErrNil       = errors.New("redisgo: nil")
+	ErrMaxActive = errors.New("redisgo: max active connection exceeded")
 
 	errProtocol       = errors.New("redisgo: protocol err")
 	errTypeMismatch   = errors.New("redisgo: type mismatch")

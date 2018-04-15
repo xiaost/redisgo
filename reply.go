@@ -56,8 +56,8 @@ func (r *Reply) IsOK() bool {
 	return r.t == replySString && len(r.b) == 2 && r.b[0] == 'O' && r.b[1] == 'K'
 }
 
-// Bytes returns bytes of "Simple Strings" and "Bulk Strings" protocol
-// https://redis.io/topics/protocol#resp-simple-strings
+// Bytes returns bytes of "Simple Strings" and "Bulk Strings" protocol:
+// https://redis.io/topics/protocol#resp-simple-strings and
 // https://redis.io/topics/protocol#resp-bulk-strings
 func (r *Reply) Bytes() ([]byte, error) {
 	if err := r.Err(); err != nil {
@@ -69,7 +69,7 @@ func (r *Reply) Bytes() ([]byte, error) {
 	return r.b, nil
 }
 
-// Integer returns int64 of integer protocol
+// Integer returns int64 of integer protocol:
 // https://redis.io/topics/protocol#resp-integers
 func (r *Reply) Integer() (int64, error) {
 	if err := r.Err(); err != nil {
@@ -81,7 +81,7 @@ func (r *Reply) Integer() (int64, error) {
 	return r.i, nil
 }
 
-// Array returns []Reply of array protocol
+// Array returns []Reply of array protocol:
 // https://redis.io/topics/protocol#resp-arrays
 func (r *Reply) Array() ([]Reply, error) {
 	if err := r.Err(); err != nil {
