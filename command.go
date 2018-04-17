@@ -4,7 +4,6 @@ import (
 	"io"
 	"strconv"
 	"sync"
-	"time"
 	"unsafe"
 )
 
@@ -13,9 +12,9 @@ const (
 )
 
 type command struct {
-	args int
-	buf  []byte
-	tmp  [1 + 24 + 2]byte // '*' or '$' + max-float-len + CRLF
+	n   int
+	buf []byte
+	tmp [1 + 24 + 2]byte // '*' or '$' + max-float-len + CRLF
 }
 
 var commandPool = sync.Pool{
@@ -25,18 +24,18 @@ var commandPool = sync.Pool{
 }
 
 func (c *command) Reset(cmd string) *command {
-	c.args = 0
+	c.n = 0
 	c.buf = c.buf[:0]
 	c.appends(cmd)
 	return c
 }
 
 func (c *command) Dump(w io.Writer) (err error) {
-	if c.args == 0 {
+	if c.n == 0 {
 		panic("command without args")
 	}
 	p := append(c.tmp[:0], '*')
-	p = strconv.AppendInt(p, int64(c.args), 10)
+	p = strconv.AppendInt(p, int64(c.n), 10)
 	p = append(p, CR, LF)
 	_, err = w.Write(p)
 	if err == nil {
@@ -46,13 +45,11 @@ func (c *command) Dump(w io.Writer) (err error) {
 }
 
 func (c *command) appendi(i int64) {
-	p := strconv.AppendInt(c.tmp[:0], i, 10)
-	c.appends(ss(p))
+	c.appends(ss(strconv.AppendInt(c.tmp[:0], i, 10)))
 }
 
 func (c *command) appendf(f float64) {
-	p := strconv.AppendFloat(c.tmp[:0], f, 'g', -1, 64)
-	c.appends(ss(p))
+	c.appends(ss(strconv.AppendFloat(c.tmp[:0], f, 'g', -1, 64)))
 }
 
 func (c *command) appends(s string) {
@@ -61,10 +58,7 @@ func (c *command) appends(s string) {
 	c.buf = append(c.buf, CR, LF)
 	c.buf = append(c.buf, s...)
 	c.buf = append(c.buf, CR, LF)
-	c.args++
-}
-
-func (c *command) appendd(t time.Duration) {
+	c.n++
 }
 
 // Args append args to the command.

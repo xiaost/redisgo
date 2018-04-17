@@ -59,6 +59,7 @@ func TestRedis(t *testing.T) {
 }
 
 func BenchmarkCmdSet(b *testing.B) {
+	b.ReportAllocs()
 	var conn = net.Conn(&FakeConn{reply: []byte("+OK\r\n")})
 	cli := NewConn(conn, WithReadTimeout(0), WithWriteTimeout(0))
 	var reply Reply
