@@ -26,18 +26,31 @@ func TestRedis(t *testing.T) {
 		t.Fatal("set not ok")
 	}
 
-	resp, err := cli.Do("GET", "mykey")
+	b, err := cli.DoBytes("GET", "mykey")
 	if err != nil {
 		t.Fatal(err)
 	}
-	if s, _ := resp.Bytes(); string(s) != "myvalue" {
-		t.Fatal(s)
+	if string(b) != "myvalue" {
+		t.Fatal(string(b))
 	}
-	resp.Free()
+
+	bb, err := cli.DoBytesSlice("MGET", "mykey", "notexistskey")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(bb) != 2 {
+		t.Fatal(len(bb))
+	}
+	if string(bb[0]) != "myvalue" {
+		t.Fatal(string(bb[0]))
+	}
+	if bb[1] != nil {
+		t.Fatal(string(bb[1]))
+	}
 
 	time.Sleep(55 * time.Millisecond)
 
-	resp, err = cli.Do("GET", "mykey")
+	resp, err := cli.Do("GET", "mykey")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -46,14 +59,11 @@ func TestRedis(t *testing.T) {
 	}
 	resp.Free()
 
-	resp, err = cli.Do("XXX", "mykey")
-	if err != nil {
-		t.Fatal(err)
+	_, err = cli.DoBytes("XXX", "mykey")
+	if err == nil {
+		t.Fatal("nil")
 	}
-	if resp.Err() == nil {
-		t.Fatal("resp err == nil")
-	}
-	t.Log(resp.Err())
+	t.Log(err)
 
 	cli.Do("MGET", "x", "y")
 }

@@ -7,14 +7,14 @@ import (
 type replyType int
 
 const (
-	replyUnset replyType = iota
-	replyNil
-	replyError
-	replyInteger
-	replySString
-	replyBString
-	replyNilArray
-	replyArray
+	typeUnset replyType = iota
+	typeNil
+	typeError
+	typeInteger
+	typeSString
+	typeBString
+	typeNilArray
+	typeArray
 )
 
 // Reply represents a reply of redis
@@ -37,8 +37,8 @@ var replyPool = sync.Pool{
 
 // Reset resets fields of Reply
 func (r *Reply) Reset() {
-	r.t = replyUnset
-	r.b = nil
+	r.t = typeUnset
+	r.b = nil // never reuse it
 	r.i = -1
 	for i := range r.array {
 		r.array[i].Reset() // remove ref for gc friendly
@@ -48,12 +48,12 @@ func (r *Reply) Reset() {
 
 // IsNil returns true if redis response a "Null Bulk String"
 func (r *Reply) IsNil() bool {
-	return r.t == replyNil
+	return r.t == typeNil
 }
 
 // IsOK returns true if redis reply "+OK"
 func (r *Reply) IsOK() bool {
-	return r.t == replySString && len(r.b) == 2 && r.b[0] == 'O' && r.b[1] == 'K'
+	return r.t == typeSString && len(r.b) == 2 && r.b[0] == 'O' && r.b[1] == 'K'
 }
 
 // Bytes returns bytes of "Simple Strings" and "Bulk Strings" protocol:
@@ -63,7 +63,7 @@ func (r *Reply) Bytes() ([]byte, error) {
 	if err := r.Err(); err != nil {
 		return nil, err
 	}
-	if r.t != replySString && r.t != replyBString {
+	if r.t != typeSString && r.t != typeBString {
 		return nil, errTypeMismatch
 	}
 	return r.b, nil
@@ -75,7 +75,7 @@ func (r *Reply) Integer() (int64, error) {
 	if err := r.Err(); err != nil {
 		return 0, err
 	}
-	if r.t != replyInteger {
+	if r.t != typeInteger {
 		return 0, errTypeMismatch
 	}
 	return r.i, nil
@@ -87,10 +87,10 @@ func (r *Reply) Array() ([]Reply, error) {
 	if err := r.Err(); err != nil {
 		return nil, err
 	}
-	if r.t != replyArray && r.t != replyNilArray {
+	if r.t != typeArray && r.t != typeNilArray {
 		return nil, errTypeMismatch
 	}
-	if r.t == replyNilArray {
+	if r.t == typeNilArray {
 		return nil, nil
 	}
 	return r.array, nil
@@ -98,16 +98,16 @@ func (r *Reply) Array() ([]Reply, error) {
 
 // Err returns ErrNil or RedisErr or nil
 func (r *Reply) Err() error {
-	if r.t == replyError {
+	if r.t == typeError {
 		return r.err
 	}
-	if r.t == replyNil {
+	if r.t == typeNil {
 		return ErrNil
 	}
 	return nil
 }
 
-// Free resets reply and put it back to memory pool
+// Free resets Reply and put it back to memory pool
 func (r *Reply) Free() {
 	if r == nil {
 		return

@@ -174,14 +174,14 @@ func (c *Conn) read(r *Reply) (err error) {
 	switch t {
 	case '+': // Simple Strings
 		r.b = b
-		r.t = replySString
+		r.t = typeSString
 	case '$': // Bulk Strings
 		n, err = strconv.Atoi(ss(b))
 		if err != nil {
 			return
 		}
 		if n == -1 {
-			r.t = replyNil
+			r.t = typeNil
 			return
 		}
 		r.b, err = c.br.Read(n + 2)
@@ -189,11 +189,11 @@ func (c *Conn) read(r *Reply) (err error) {
 			return
 		}
 		r.b = r.b[:n]
-		r.t = replyBString
+		r.t = typeBString
 	case ':': // Integers
 		r.i, err = strconv.ParseInt(ss(b), 10, 64)
 		if err == nil {
-			r.t = replyInteger
+			r.t = typeInteger
 		}
 	case '*': // Arrays
 		n, err = strconv.Atoi(ss(b))
@@ -201,24 +201,69 @@ func (c *Conn) read(r *Reply) (err error) {
 			return
 		}
 		if n == -1 {
-			r.t = replyArray
+			r.t = typeNilArray
 			return
 		}
 		if r.array == nil {
-			r.array = make([]Reply, 0, n)
+			r.array = make([]Reply, n)
 		}
 		for i := 0; i < n; i++ {
-			e := Reply{}
-			if err = c.read(&e); err != nil {
+			if err = c.read(&r.array[i]); err != nil {
 				return
 			}
-			r.array = append(r.array, e)
 		}
+		r.t = typeArray
 	case '-': // Errors
-		r.t = replyError
+		r.t = typeError
 		r.err = *(*RedisErr)(unsafe.Pointer(&b))
 	default:
 		err = errProtocol
 	}
 	return
+}
+
+// DoBytes wraps Do() and Reply.Bytes()
+func (c *Conn) DoBytes(cmd string, args ...interface{}) ([]byte, error) {
+	reply, err := c.Do(cmd, args...)
+	if err != nil {
+		return nil, err
+	}
+	defer reply.Free()
+	return reply.Bytes()
+}
+
+// DoBytesSlice wraps Do() and reply.Array() and reply.Bytes()
+func (c *Conn) DoBytesSlice(cmd string, args ...interface{}) ([][]byte, error) {
+	reply, err := c.Do(cmd, args...)
+	if err != nil {
+		return nil, err
+	}
+	defer reply.Free()
+	aa, err := reply.Array()
+	if err != nil {
+		return nil, err
+	}
+	ret := make([][]byte, 0, len(aa))
+	for i := range aa {
+		if aa[i].IsNil() {
+			ret = append(ret, []byte(nil))
+			continue
+		}
+		b, err := aa[i].Bytes()
+		if err != nil {
+			return nil, err
+		}
+		ret = append(ret, b)
+	}
+	return ret, nil
+}
+
+// DoInt wraps Do() and reply.Integer()
+func (c *Conn) DoInteger(cmd string, args ...interface{}) (int64, error) {
+	reply, err := c.Do(cmd, args...)
+	if err != nil {
+		return 0, err
+	}
+	defer reply.Free()
+	return reply.Integer()
 }
