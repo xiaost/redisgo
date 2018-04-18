@@ -25,8 +25,9 @@ func (c *PoolConn) Close() {
 	if c.Conn.pd != 0 {
 		c.Conn.Close()
 	}
-	c.p.put(c)
+	p := c.p
 	c.p = nil
+	p.put(c)
 }
 
 // Pool represents a Conn pool
