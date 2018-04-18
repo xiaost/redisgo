@@ -222,6 +222,16 @@ func (c *Conn) read(r *Reply) (err error) {
 	return
 }
 
+// DoNoReply wraps Do() and Reply.Err()
+func (c *Conn) DoNoReply(cmd string, args ...interface{}) error {
+	reply, err := c.Do(cmd, args...)
+	if err != nil {
+		return err
+	}
+	defer reply.Free()
+	return reply.Err()
+}
+
 // DoBytes wraps Do() and Reply.Bytes()
 func (c *Conn) DoBytes(cmd string, args ...interface{}) ([]byte, error) {
 	reply, err := c.Do(cmd, args...)
