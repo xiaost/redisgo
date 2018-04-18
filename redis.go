@@ -205,9 +205,10 @@ func (c *Conn) read(r *Reply) (err error) {
 			return
 		}
 		if r.array == nil {
-			r.array = make([]Reply, n)
+			r.array = make([]Reply, 0, n)
 		}
 		for i := 0; i < n; i++ {
+			r.array = append(r.array, Reply{})
 			if err = c.read(&r.array[i]); err != nil {
 				return
 			}
