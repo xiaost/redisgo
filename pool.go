@@ -20,8 +20,8 @@ func (c *PoolConn) CreatedAt() time.Time {
 	return c.createdAt
 }
 
-// Free puts PoolConn back to the pool
-func (c *PoolConn) Free() {
+// Close puts PoolConn back to the pool
+func (c *PoolConn) Close() {
 	c.p.put(c)
 	c.p = nil
 }
