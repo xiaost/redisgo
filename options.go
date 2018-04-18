@@ -18,6 +18,7 @@ var defaultoptions = options{
 	wtimeout: 30 * time.Second,
 }
 
+// WithReadBuffer set read buffer size of connection
 func WithReadBuffer(sz int) Option {
 	return func(opt options) options {
 		opt.rbuf = sz
@@ -25,6 +26,7 @@ func WithReadBuffer(sz int) Option {
 	}
 }
 
+// WithWriteBuffer set write buffer size of connection
 func WithWriteBuffer(sz int) Option {
 	return func(opt options) options {
 		opt.wbuf = sz
@@ -32,6 +34,7 @@ func WithWriteBuffer(sz int) Option {
 	}
 }
 
+// WithReadTimeout set read timeout of Conn.Recv
 func WithReadTimeout(t time.Duration) Option {
 	return func(opt options) options {
 		opt.rtimeout = t
@@ -39,6 +42,7 @@ func WithReadTimeout(t time.Duration) Option {
 	}
 }
 
+// WithWriteTimeout set write timeout of Conn.Send
 func WithWriteTimeout(t time.Duration) Option {
 	return func(opt options) options {
 		opt.wtimeout = t

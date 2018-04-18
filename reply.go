@@ -35,6 +35,7 @@ var replyPool = sync.Pool{
 	},
 }
 
+// NewReply creates Reply instance from pool
 func NewReply() *Reply {
 	return replyPool.Get().(*Reply)
 }
