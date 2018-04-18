@@ -16,6 +16,7 @@ type Conn struct {
 
 	err    error
 	closed bool
+	pd     int
 
 	rtimeout time.Duration
 	wtimeout time.Duration
@@ -76,6 +77,7 @@ func (c *Conn) Send(cmd string, args ...interface{}) (err error) {
 			return c.seterr(errInvalidArgType)
 		}
 	}
+	c.pd++
 	if c.wtimeout > 0 {
 		c.conn.SetWriteDeadline(time.Now().Add(c.wtimeout))
 	}
@@ -111,6 +113,7 @@ func (c *Conn) Recv(reply *Reply) (err error) {
 			return
 		}
 	}
+	c.pd--
 	if c.rtimeout > 0 {
 		c.conn.SetReadDeadline(time.Now().Add(c.rtimeout))
 	}

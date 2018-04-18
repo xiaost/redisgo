@@ -22,6 +22,9 @@ func (c *PoolConn) CreatedAt() time.Time {
 
 // Close puts PoolConn back to the pool
 func (c *PoolConn) Close() {
+	if c.Conn.pd != 0 {
+		c.Conn.Close()
+	}
 	c.p.put(c)
 	c.p = nil
 }
