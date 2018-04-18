@@ -35,6 +35,10 @@ var replyPool = sync.Pool{
 	},
 }
 
+func NewReply() *Reply {
+	return replyPool.Get().(*Reply)
+}
+
 // Reset resets fields of Reply
 func (r *Reply) Reset() {
 	r.t = typeUnset
