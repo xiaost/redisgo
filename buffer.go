@@ -67,7 +67,7 @@ func (r *reader) Read(n int) (b []byte, err error) {
 			return
 		}
 	}
-	b = r.bytes()[:n]
+	b = r.bytes()[:n:n]
 	r.r += n
 	return
 }
@@ -103,7 +103,7 @@ func (r *reader) Readline() (b []byte, err error) {
 		p := r.bytes()
 		pos := bytes.IndexByte(p[start:], LF)
 		if pos > 0 && p[start+pos-1] == CR {
-			b = p[:start+pos+1]
+			b = p[: start+pos+1 : start+pos+1]
 			r.r += (start + pos + 1)
 			return
 		}

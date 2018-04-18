@@ -191,7 +191,7 @@ func (c *Conn) read(r *Reply) (err error) {
 		if err != nil {
 			return
 		}
-		r.b = r.b[:n]
+		r.b = r.b[:n:n]
 		r.t = typeBString
 	case ':': // Integers
 		r.i, err = strconv.ParseInt(ss(b), 10, 64)
