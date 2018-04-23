@@ -6,6 +6,9 @@ import (
 	"sync"
 	"testing"
 	"time"
+	// comment it for package manage tools friendly
+	// goredis "github.com/go-redis/redis"
+	// redigo "github.com/gomodule/redigo/redis"
 )
 
 func TestRedis(t *testing.T) {
@@ -68,7 +71,7 @@ func TestRedis(t *testing.T) {
 	cli.Do("MGET", "x", "y")
 }
 
-func BenchmarkCmdSet(b *testing.B) {
+func BenchmarkCmdSetRedisgo(b *testing.B) {
 	b.ReportAllocs()
 	var conn = net.Conn(&FakeConn{reply: []byte("+OK\r\n")})
 	cli := NewConn(conn, WithReadTimeout(0), WithWriteTimeout(0))
@@ -76,7 +79,7 @@ func BenchmarkCmdSet(b *testing.B) {
 	for i := 0; i < b.N; i++ {
 		key := "key"
 		val := "value"
-		if err := cli.Send("SET", key, val, "PX", i); err != nil {
+		if err := cli.Send("SET", key, val, "EX", i); err != nil {
 			b.Fatal(err)
 		}
 		cli.Flush()
@@ -86,6 +89,43 @@ func BenchmarkCmdSet(b *testing.B) {
 		_, _ = reply.Bytes()
 	}
 }
+
+/* comment it for package manage tools friendly
+func BenchmarkCmdSetRedigo(b *testing.B) {
+	b.ReportAllocs()
+	var conn = net.Conn(&FakeConn{reply: []byte("+OK\r\n")})
+	cli := redigo.NewConn(conn, 0, 0)
+	for i := 0; i < b.N; i++ {
+		key := "key"
+		val := "value"
+		if err := cli.Send("SET", key, val, "EX", i); err != nil {
+			b.Fatal(err)
+		}
+		cli.Flush()
+		_, err := redigo.Bytes(cli.Receive())
+		if err != nil {
+			b.Fatal(err)
+		}
+	}
+}
+
+func BenchmarkCmdSetGoredis(b *testing.B) {
+	b.ReportAllocs()
+	opts := goredis.Options{
+		Dialer: func() (net.Conn, error) {
+			return &FakeConn{reply: []byte("+OK\r\n")}, nil
+		},
+	}
+	cli := goredis.NewClient(&opts)
+	for i := 0; i < b.N; i++ {
+		key := "key"
+		val := "value"
+		if err := cli.Set(key, val, time.Duration(i)*time.Second).Err(); err != nil {
+			b.Fatal(err)
+		}
+	}
+}
+*/
 
 type FakeConn struct {
 	mu     sync.Mutex
