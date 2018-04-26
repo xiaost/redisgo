@@ -50,7 +50,7 @@ type Pool struct {
 // PoolOption represents a pool option
 type PoolOption func(p *Pool)
 
-// WithMaxIdle limits pool max idle conns to n
+// WithMaxIdle limits pool max idle conns to n, default: 5.
 func WithMaxIdle(n int) PoolOption {
 	return func(p *Pool) {
 		p.maxIdle = int(n)
@@ -121,7 +121,8 @@ func (p *Pool) Get(ctx context.Context) (*PoolConn, error) {
 		return nil, ctx.Err()
 	default:
 	}
-	if atomic.AddInt64(&p.active, 1) > p.maxActive {
+	active := atomic.AddInt64(&p.active, 1)
+	if p.maxActive > 0 && active > p.maxActive {
 		atomic.AddInt64(&p.active, -1)
 		return nil, ErrMaxActive
 	}
