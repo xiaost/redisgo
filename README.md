@@ -46,7 +46,7 @@ func main() {
     /*  or you can do it like this:
     reply, err := c.Do(cmd, args...)
     if err == nil {
-        err := reply.Err()
+        err = reply.Err()
         reply.Free()
     }
     */
@@ -56,9 +56,10 @@ func main() {
 
     b, err := redisconn.DoBytes("GET", "hello")
     /* or you can do it like this:
+    var b []byte
     reply, err := c.Do("GET", "hello")
     if err == nil {
-        b, err := reply.Bytes()
+        b, err = reply.Bytes()
         reply.Free()
     }
     */
