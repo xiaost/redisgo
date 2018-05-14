@@ -110,13 +110,13 @@ func (p *Pool) Get(ctx context.Context) (*PoolConn, error) {
 	select {
 	case conn := <-p.ch:
 		now := p.nowfunc()
-		if (p.maxIdleTime > 0 && now.Sub(conn.freedAt) < p.maxIdleTime) ||
-			(p.maxConnTime > 0 && now.Sub(conn.CreatedAt()) < p.maxConnTime) {
-			conn.p = p
-			return conn, nil
+		if (p.maxIdleTime > 0 && now.Sub(conn.freedAt) > p.maxIdleTime) ||
+			(p.maxConnTime > 0 && now.Sub(conn.CreatedAt()) > p.maxConnTime) {
+			p.closeconn(conn)
+			return p.Get(ctx)
 		}
-		p.closeconn(conn)
-		return p.Get(ctx)
+		conn.p = p
+		return conn, nil
 	case <-ctx.Done():
 		return nil, ctx.Err()
 	default:
