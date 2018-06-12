@@ -66,7 +66,7 @@ func (c *command) appends(s string) {
 // int, int8, int16, int32, int64
 // uint, uint8, uint16, uint32, uint64
 // float32, float64
-// []byte, string
+// []byte, string, []string
 func (c *command) Args(aa ...interface{}) *command {
 	for _, a := range aa {
 		switch v := a.(type) {
@@ -101,6 +101,11 @@ func (c *command) Args(aa ...interface{}) *command {
 		case string:
 			p := uintptr(unsafe.Pointer(&v))
 			c.appends(*(*string)(unsafe.Pointer(p)))
+		case []string:
+			for _, s := range v {
+				p := uintptr(unsafe.Pointer(&s))
+				c.appends(*(*string)(unsafe.Pointer(p)))
+			}
 		default:
 			panic("unknown args type")
 		}

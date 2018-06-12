@@ -34,6 +34,13 @@ func TestCommand(t *testing.T) {
 	if s := tcmd(tstr("CMD"), tstr("a0"), tstr("a1"), tstr("1")); s != buf.String() {
 		t.Fatal("expect:\n", s, "get:\n", buf.String())
 	}
+
+	buf.Reset()
+
+	c.Reset("CMD").Args([]string{"a0", "a1"}).Args(uint(1)).Dump(buf)
+	if s := tcmd(tstr("CMD"), tstr("a0"), tstr("a1"), tstr("1")); s != buf.String() {
+		t.Fatal("expect:\n", s, "get:\n", buf.String())
+	}
 }
 
 func BenchmarkCommand(b *testing.B) {
