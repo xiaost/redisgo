@@ -4,7 +4,6 @@ import (
 	"io"
 	"strconv"
 	"sync"
-	"unsafe"
 )
 
 const (
@@ -95,16 +94,12 @@ func (c *command) Args(aa ...interface{}) *command {
 		case float64:
 			c.appendf(float64(v))
 		case []byte:
-			// fix issue: https://github.com/golang/go/issues/15730
-			p := uintptr(unsafe.Pointer(&v))
-			c.appends(ss(*(*[]byte)(unsafe.Pointer(p))))
+			c.appends(ss(v))
 		case string:
-			p := uintptr(unsafe.Pointer(&v))
-			c.appends(*(*string)(unsafe.Pointer(p)))
+			c.appends(v)
 		case []string:
 			for _, s := range v {
-				p := uintptr(unsafe.Pointer(&s))
-				c.appends(*(*string)(unsafe.Pointer(p)))
+				c.appends(s)
 			}
 		default:
 			panic("unknown args type")
