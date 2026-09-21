@@ -71,3 +71,13 @@ func main() {
     }
 }
 ```
+
+### Notes
+
+- `Conn` is not safe for concurrent use; borrow one `Conn` per goroutine from a `Pool`.
+- Replies are zero-copy: byte slices returned by `Reply.Bytes`, `DoBytes`, `DoBytesSlice` and `RedisErr`
+  alias the read buffer of the connection.
+  They stay valid after `Reply.Free`, but keeping one alive keeps the whole buffer alive,
+  so copy values that you retain for long.
+- Call `Reply.Free` exactly once per `Reply` returned by `Do`.
+- Bulk strings and arrays longer than 512MB (the default `proto-max-bulk-len` of redis) are rejected as a protocol error.

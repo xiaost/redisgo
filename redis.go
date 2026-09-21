@@ -7,7 +7,14 @@ import (
 	"time"
 )
 
-// Conn represents a redis client
+// Conn represents a redis client.
+//
+// A Conn is not safe for concurrent use. Use a Pool to hand one Conn to
+// each goroutine.
+//
+// Byte slices returned through Reply alias the read buffer of the Conn.
+// They stay valid after Reply.Free, but keeping one alive keeps the whole
+// buffer alive, so copy values that are retained for long.
 type Conn struct {
 	conn net.Conn
 	br   *reader
@@ -303,7 +310,7 @@ func (c *Conn) DoBytesSlice(cmd string, args ...any) ([][]byte, error) {
 	return ret, nil
 }
 
-// DoInt wraps Do() and reply.Integer()
+// DoInteger wraps Do() and reply.Integer()
 func (c *Conn) DoInteger(cmd string, args ...any) (int64, error) {
 	reply, err := c.Do(cmd, args...)
 	if err != nil {

@@ -16,7 +16,7 @@ import (
 func TestRedis(t *testing.T) {
 	conn, err := net.Dial("tcp", "127.0.0.1:6379")
 	if err != nil {
-		t.Fatal(err)
+		t.Skip("redis not available:", err)
 	}
 	defer conn.Close()
 	cli := NewConn(conn)
@@ -59,8 +59,8 @@ func TestRedis(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if !resp.IsNil() && resp.Err() == ErrNil {
-		t.Fatal("not nil", resp)
+	if !resp.IsNil() || resp.Err() != ErrNil {
+		t.Fatal("expect nil reply", resp)
 	}
 	resp.Free()
 
@@ -68,9 +68,16 @@ func TestRedis(t *testing.T) {
 	if err == nil {
 		t.Fatal("nil")
 	}
-	t.Log(err)
+	if _, ok := err.(RedisErr); !ok {
+		t.Fatal("expect RedisErr, got", err)
+	}
 
-	cli.Do("MGET", "x", "y")
+	if bb, err = cli.DoBytesSlice("MGET", "x", "y"); err != nil || len(bb) != 2 {
+		t.Fatal(bb, err)
+	}
+	if cli.Err() != nil {
+		t.Fatal(cli.Err())
+	}
 }
 
 func BenchmarkCmdSetRedisgo(b *testing.B) {

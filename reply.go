@@ -65,6 +65,8 @@ func (r *Reply) IsOK() bool {
 // Bytes returns bytes of "Simple Strings" and "Bulk Strings" protocol:
 // https://redis.io/topics/protocol#resp-simple-strings and
 // https://redis.io/topics/protocol#resp-bulk-strings
+//
+// The returned slice aliases the read buffer of the Conn, see Conn.
 func (r *Reply) Bytes() ([]byte, error) {
 	if err := r.Err(); err != nil {
 		return nil, err
@@ -113,7 +115,8 @@ func (r *Reply) Err() error {
 	return nil
 }
 
-// Free resets Reply and put it back to memory pool
+// Free resets Reply and put it back to memory pool.
+// A Reply must not be used, or freed again, after Free.
 func (r *Reply) Free() {
 	if r == nil {
 		return
