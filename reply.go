@@ -28,7 +28,7 @@ type Reply struct {
 }
 
 var replyPool = sync.Pool{
-	New: func() interface{} {
+	New: func() any {
 		r := new(Reply)
 		r.p = true
 		return r

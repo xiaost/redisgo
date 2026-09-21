@@ -1,10 +1,8 @@
 package redisgo
 
-import (
-	"unsafe"
-)
+import "unsafe"
 
-func validarg(a interface{}) bool {
+func validarg(a any) bool {
 	switch a.(type) {
 	case int, int8, int16, int32, int64:
 	case uint, uint8, uint16, uint32, uint64:
@@ -15,6 +13,8 @@ func validarg(a interface{}) bool {
 	return true
 }
 
+// ss converts b to a string without copying.
+// The caller must not modify b afterwards.
 func ss(b []byte) string {
-	return *(*string)(unsafe.Pointer(&b))
+	return unsafe.String(unsafe.SliceData(b), len(b))
 }

@@ -55,7 +55,7 @@ func (c *Conn) SetTimeout(t time.Duration) {
 
 // Do sends command to redis and recv reply.
 // Reply.Free() SHOULD be called when no longer used
-func (c *Conn) Do(cmd string, args ...interface{}) (*Reply, error) {
+func (c *Conn) Do(cmd string, args ...any) (*Reply, error) {
 	if err := c.Send(cmd, args...); err != nil {
 		return nil, err
 	}
@@ -68,7 +68,7 @@ func (c *Conn) Do(cmd string, args ...interface{}) (*Reply, error) {
 }
 
 // Send sends command to redis
-func (c *Conn) Send(cmd string, args ...interface{}) (err error) {
+func (c *Conn) Send(cmd string, args ...any) (err error) {
 	if err = c.Err(); err != nil {
 		return
 	}
@@ -227,7 +227,7 @@ func (c *Conn) read(r *Reply) (err error) {
 }
 
 // DoNoReply wraps Do() and Reply.Err()
-func (c *Conn) DoNoReply(cmd string, args ...interface{}) error {
+func (c *Conn) DoNoReply(cmd string, args ...any) error {
 	reply, err := c.Do(cmd, args...)
 	if err != nil {
 		return err
@@ -237,7 +237,7 @@ func (c *Conn) DoNoReply(cmd string, args ...interface{}) error {
 }
 
 // DoBytes wraps Do() and Reply.Bytes()
-func (c *Conn) DoBytes(cmd string, args ...interface{}) ([]byte, error) {
+func (c *Conn) DoBytes(cmd string, args ...any) ([]byte, error) {
 	reply, err := c.Do(cmd, args...)
 	if err != nil {
 		return nil, err
@@ -247,7 +247,7 @@ func (c *Conn) DoBytes(cmd string, args ...interface{}) ([]byte, error) {
 }
 
 // DoBytesSlice wraps Do() and reply.Array() and reply.Bytes()
-func (c *Conn) DoBytesSlice(cmd string, args ...interface{}) ([][]byte, error) {
+func (c *Conn) DoBytesSlice(cmd string, args ...any) ([][]byte, error) {
 	reply, err := c.Do(cmd, args...)
 	if err != nil {
 		return nil, err
@@ -273,7 +273,7 @@ func (c *Conn) DoBytesSlice(cmd string, args ...interface{}) ([][]byte, error) {
 }
 
 // DoInt wraps Do() and reply.Integer()
-func (c *Conn) DoInteger(cmd string, args ...interface{}) (int64, error) {
+func (c *Conn) DoInteger(cmd string, args ...any) (int64, error) {
 	reply, err := c.Do(cmd, args...)
 	if err != nil {
 		return 0, err

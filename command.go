@@ -17,7 +17,7 @@ type command struct {
 }
 
 var commandPool = sync.Pool{
-	New: func() interface{} {
+	New: func() any {
 		return &command{buf: make([]byte, 0, cmdbufsz)}
 	},
 }
@@ -66,7 +66,7 @@ func (c *command) appends(s string) {
 // uint, uint8, uint16, uint32, uint64
 // float32, float64
 // []byte, string, []string
-func (c *command) Args(aa ...interface{}) *command {
+func (c *command) Args(aa ...any) *command {
 	for _, a := range aa {
 		switch v := a.(type) {
 		case int:
