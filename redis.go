@@ -5,7 +5,6 @@ import (
 	"net"
 	"strconv"
 	"time"
-	"unsafe"
 )
 
 // Conn represents a redis client
@@ -160,6 +159,25 @@ func (c *Conn) seterr(err error) error {
 	return err
 }
 
+// maxLen bounds the bulk string length and array size accepted from the
+// server. It matches the default proto-max-bulk-len of redis (512MB) and
+// protects the client from absurd lengths sent by a broken peer.
+const maxLen = 512 << 20
+
+// maxArrayPrealloc bounds the array capacity allocated up front from a
+// single header, so a bogus header cannot trigger a huge allocation.
+const maxArrayPrealloc = 1024
+
+// parseLen parses the length field of a bulk string or array header.
+// -1 is valid and denotes a nil value.
+func parseLen(b []byte) (int, error) {
+	n, err := strconv.ParseInt(ss(b), 10, 64)
+	if err != nil || n < -1 || n > maxLen {
+		return 0, errProtocol
+	}
+	return int(n), nil
+}
+
 func (c *Conn) read(r *Reply) (err error) {
 	var b []byte
 	b, err = c.br.Readline()
@@ -168,8 +186,7 @@ func (c *Conn) read(r *Reply) (err error) {
 	}
 	b = b[:len(b)-2] // remove CRLF
 	if len(b) == 0 {
-		err = errProtocol
-		return
+		return errProtocol
 	}
 	t := b[0]
 	b = b[1:]
@@ -179,39 +196,45 @@ func (c *Conn) read(r *Reply) (err error) {
 		r.b = b
 		r.t = typeSString
 	case '$': // Bulk Strings
-		n, err = strconv.Atoi(ss(b))
-		if err != nil {
+		if n, err = parseLen(b); err != nil {
 			return
 		}
-		if n == -1 {
+		if n < 0 {
 			r.t = typeNil
 			return
 		}
-		r.b, err = c.br.Read(n + 2)
-		if err != nil {
+		if r.b, err = c.br.Read(n + 2); err != nil {
 			return
+		}
+		if r.b[n] != CR || r.b[n+1] != LF {
+			return errProtocol
 		}
 		r.b = r.b[:n:n]
 		r.t = typeBString
 	case ':': // Integers
-		r.i, err = strconv.ParseInt(ss(b), 10, 64)
-		if err == nil {
-			r.t = typeInteger
+		if r.i, err = strconv.ParseInt(ss(b), 10, 64); err != nil {
+			return errProtocol
 		}
+		r.t = typeInteger
 	case '*': // Arrays
-		n, err = strconv.Atoi(ss(b))
-		if err != nil {
+		if n, err = parseLen(b); err != nil {
 			return
 		}
-		if n == -1 {
+		if n < 0 {
 			r.t = typeNilArray
 			return
 		}
-		if r.array == nil {
-			r.array = make([]Reply, 0, n)
+		if r.array == nil || cap(r.array) < n {
+			r.array = make([]Reply, 0, min(n, maxArrayPrealloc))
 		}
 		for i := 0; i < n; i++ {
-			r.array = append(r.array, Reply{})
+			if i < cap(r.array) {
+				// reuse the element, its nested array keeps its capacity.
+				// Reset guarantees every element within cap is clean.
+				r.array = r.array[:i+1]
+			} else {
+				r.array = append(r.array, Reply{})
+			}
 			if err = c.read(&r.array[i]); err != nil {
 				return
 			}
@@ -219,7 +242,7 @@ func (c *Conn) read(r *Reply) (err error) {
 		r.t = typeArray
 	case '-': // Errors
 		r.t = typeError
-		r.err = *(*RedisErr)(unsafe.Pointer(&b))
+		r.err = RedisErr(b)
 	default:
 		err = errProtocol
 	}

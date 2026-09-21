@@ -43,8 +43,9 @@ func NewReply() *Reply {
 // Reset resets fields of Reply
 func (r *Reply) Reset() {
 	r.t = typeUnset
-	r.b = nil // never reuse it
-	r.i = -1
+	r.b = nil // never reuse it, it aliases the read buffer
+	r.i = 0
+	r.err = nil // aliases the read buffer as well
 	for i := range r.array {
 		r.array[i].Reset() // remove ref for gc friendly
 	}
