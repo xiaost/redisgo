@@ -1,9 +1,11 @@
 package redisgo
 
 import (
+	"bytes"
+	"errors"
 	"io"
 	"net"
-	"sync"
+	"strings"
 	"testing"
 	"time"
 	// comment it for package manage tools friendly
@@ -128,7 +130,6 @@ func BenchmarkCmdSetGoredis(b *testing.B) {
 */
 
 type FakeConn struct {
-	mu     sync.Mutex
 	reply  []byte
 	r      int
 	closed bool
@@ -162,3 +163,95 @@ func (c *FakeConn) RemoteAddr() net.Addr        { return noaddr{} }
 func (c *FakeConn) SetDeadline(time.Time) error      { return nil }
 func (c *FakeConn) SetReadDeadline(time.Time) error  { return nil }
 func (c *FakeConn) SetWriteDeadline(time.Time) error { return nil }
+
+// failConn fails every write, replies are never needed.
+type failConn struct{ FakeConn }
+
+func (c *failConn) Write([]byte) (int, error) { return 0, errors.New("write failed") }
+
+func TestFlushErrorIsFatal(t *testing.T) {
+	c := NewConn(&failConn{}, WithReadTimeout(0), WithWriteTimeout(0))
+	if err := c.Send("PING"); err != nil {
+		t.Fatal(err)
+	}
+	err := c.Flush()
+	if err == nil || err.Error() != "write failed" {
+		t.Fatal(err)
+	}
+	if c.Err() != err {
+		t.Fatalf("Flush error not recorded: %v", c.Err())
+	}
+	if !c.closed {
+		t.Fatal("connection not closed after fatal write error")
+	}
+	if err := c.Send("PING"); err != c.Err() {
+		t.Fatal(err)
+	}
+	if err := c.Flush(); err != c.Err() {
+		t.Fatal(err)
+	}
+	if err := c.Close(); err != errClosed {
+		t.Fatal(err)
+	}
+}
+
+func TestCloseFlushes(t *testing.T) {
+	sink := new(bytes.Buffer)
+	c := NewConn(&FakeConn{}, WithReadTimeout(0), WithWriteTimeout(0))
+	c.bw.Reset(sink)
+	if err := c.Send("QUIT"); err != nil {
+		t.Fatal(err)
+	}
+	if err := c.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if sink.String() != "*1\r\n$4\r\nQUIT\r\n" {
+		t.Fatalf("Close did not flush: %q", sink.String())
+	}
+	if err := c.Close(); err != errClosed {
+		t.Fatal(err)
+	}
+	if err := c.Send("PING"); err != errClosed {
+		t.Fatal(err)
+	}
+}
+
+// deadlineConn counts deadline updates.
+type deadlineConn struct {
+	chunkConn
+	rd, wd int
+}
+
+func (c *deadlineConn) SetReadDeadline(time.Time) error  { c.rd++; return nil }
+func (c *deadlineConn) SetWriteDeadline(time.Time) error { c.wd++; return nil }
+
+// TestDeadlinesOnlyWhenTouchingNetwork checks that pipelined Sends do not
+// arm the write deadline while they only fill the buffer.
+func TestDeadlinesOnlyWhenTouchingNetwork(t *testing.T) {
+	dc := &deadlineConn{chunkConn: chunkConn{data: []byte(strings.Repeat("+OK\r\n", 10))}}
+	c := NewConn(dc, WithReadTimeout(time.Second), WithWriteTimeout(time.Second))
+	var r Reply
+	for i := 0; i < 10; i++ {
+		if err := c.Send("SET", "k", "v"); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if dc.wd != 0 {
+		t.Fatalf("expect no write deadline while buffering, got %d", dc.wd)
+	}
+	for i := 0; i < 10; i++ {
+		if err := c.Recv(&r); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if dc.wd != 1 || dc.rd != 10 {
+		t.Fatalf("expect 1 write and 10 read deadlines, got %d and %d", dc.wd, dc.rd)
+	}
+	// a command larger than the buffer must arm the write deadline itself
+	if err := c.Send("SET", "k", strings.Repeat("v", 4096)); err != nil {
+		t.Fatal(err)
+	}
+	if dc.wd != 2 {
+		t.Fatalf("expect write deadline for an oversized command, got %d", dc.wd)
+	}
+}

@@ -100,29 +100,23 @@ func (c *Conn) Send(cmd string, args ...any) error {
 
 // Flush writes any buffered data to redis
 func (c *Conn) Flush() error {
+	if err := c.Err(); err != nil {
+		return err
+	}
 	if c.bw.Buffered() == 0 {
 		return nil
 	}
 	if c.wtimeout > 0 {
 		c.conn.SetWriteDeadline(time.Now().Add(c.wtimeout))
 	}
-	return c.bw.Flush()
+	return c.seterr(c.bw.Flush())
 }
 
 // Recv receives reply from redis
-func (c *Conn) Recv(reply *Reply) (err error) {
+func (c *Conn) Recv(reply *Reply) error {
 	reply.Reset()
-	if err = c.Err(); err != nil {
-		return
-	}
-	if c.bw.Buffered() > 0 {
-		if c.wtimeout > 0 {
-			c.conn.SetWriteDeadline(time.Now().Add(c.wtimeout))
-		}
-		err = c.seterr(c.bw.Flush())
-		if err != nil {
-			return
-		}
+	if err := c.Flush(); err != nil {
+		return err
 	}
 	c.pd--
 	if c.rtimeout > 0 {
@@ -136,15 +130,17 @@ func (c *Conn) Conn() net.Conn {
 	return c.conn
 }
 
-// Close closes the underlying connection
+// Close flushes buffered commands and closes the underlying connection.
+// It returns errClosed if the connection was closed already, by Close or
+// by an earlier fatal error.
 func (c *Conn) Close() error {
-	c.Flush()
 	if c.closed {
 		return errClosed
 	}
-	if c.err == nil {
-		c.err = errClosed
+	if err := c.Flush(); err != nil {
+		return err // Flush closed the connection already
 	}
+	c.err = errClosed
 	c.closed = true
 	return c.conn.Close()
 }
