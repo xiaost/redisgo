@@ -12,6 +12,7 @@ type Conn struct {
 	conn net.Conn
 	br   *reader
 	bw   *bufio.Writer
+	cmd  []byte // scratch for commands larger than bw
 
 	err    error
 	closed bool
@@ -66,24 +67,35 @@ func (c *Conn) Do(cmd string, args ...any) (*Reply, error) {
 	return reply, nil
 }
 
-// Send sends command to redis
-func (c *Conn) Send(cmd string, args ...any) (err error) {
-	if err = c.Err(); err != nil {
-		return
+// Send buffers a command for redis. Nothing is written to the network until
+// Flush or Recv is called or the write buffer fills up.
+// Send returns errInvalidArgType without touching the connection if an arg
+// has an unsupported type.
+func (c *Conn) Send(cmd string, args ...any) error {
+	if err := c.Err(); err != nil {
+		return err
 	}
-	for _, a := range args {
-		if !validarg(a) {
-			return c.seterr(errInvalidArgType)
-		}
+	n, size, err := argsInfo(args)
+	if err != nil {
+		return err
 	}
 	c.pd++
+	if cmdSize(cmd, size) <= c.bw.Available() {
+		// The command fits: encode it straight into the spare capacity of
+		// the writer. Nothing is flushed, so no write deadline is needed.
+		_, err = c.bw.Write(appendCommand(c.bw.AvailableBuffer(), cmd, n, args))
+		return c.seterr(err)
+	}
+	// bufio flushes while writing a command that does not fit.
 	if c.wtimeout > 0 {
 		c.conn.SetWriteDeadline(time.Now().Add(c.wtimeout))
 	}
-	cc := commandPool.Get().(*command)
-	err = c.seterr(cc.Reset(cmd).Args(args...).Dump(c.bw))
-	commandPool.Put(cc)
-	return
+	c.cmd = appendCommand(c.cmd[:0], cmd, n, args)
+	_, err = c.bw.Write(c.cmd)
+	if cap(c.cmd) > maxCmdBuf {
+		c.cmd = nil // do not pin a huge scratch buffer to the conn
+	}
+	return c.seterr(err)
 }
 
 // Flush writes any buffered data to redis
