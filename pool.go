@@ -55,7 +55,15 @@ func (c *PoolConn) Close() {
 	}
 }
 
-// Pool represents a Conn pool
+// Pool represents a Conn pool. It is safe for concurrent use.
+//
+// A conn is closed instead of being put back if it has replies pending, has
+// failed, or its session was changed: by SELECT, AUTH, HELLO, RESET, ASKING,
+// READONLY, READWRITE, MONITOR, QUIT, SCRIPT DEBUG, a CLIENT subcommand
+// other than ID, INFO, LIST, GETNAME, GETREDIR or TRACKINGINFO, a pub/sub
+// command, or a MULTI or WATCH not ended by EXEC, DISCARD or UNWATCH. So
+// the next caller always gets a fresh session. What DialFunc sets up, such as AUTH
+// and SELECT, is the base state of a conn and is kept.
 type Pool struct {
 	dial DialFunc
 
@@ -249,6 +257,15 @@ func (p *Pool) dialconn(ctx context.Context) (idleConn, error) {
 		p.closeconn(c)
 		return idleConn{}, ErrPoolClosed
 	}
+	// What DialFunc set up, like SELECT, is the base state. A conn it left
+	// in a transaction, watching keys or pushing cannot get back to it once
+	// that ends, so it is not reused, and a pushing one stays one, so Do
+	// rejects commands on it.
+	if c.state&^stateChanged != 0 {
+		c.state |= stateChanged
+	} else {
+		c.state = 0
+	}
 	c.createdAt = p.nowfunc()
 	if err := ctx.Err(); err != nil { // ctx was done while dialing
 		p.put(c)
@@ -266,9 +283,10 @@ func (p *Pool) release() {
 }
 
 // put parks c in the pool, or closes it if it has replies pending, has
-// failed, has lived too long, or the pool is full or closed.
+// failed, has a changed session, has lived too long, or the pool is full
+// or closed.
 func (p *Pool) put(c *Conn) {
-	if c.Err() != nil || c.pd != 0 || p.closed.Load() {
+	if c.Err() != nil || c.pd != 0 || c.state != 0 || p.closed.Load() {
 		p.closeconn(c)
 		return
 	}

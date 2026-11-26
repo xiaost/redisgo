@@ -6,6 +6,7 @@ import (
 	"net"
 	"os"
 	"strconv"
+	"strings"
 	"sync/atomic"
 	"time"
 )
@@ -29,7 +30,10 @@ type Conn struct {
 
 	err    error
 	closed bool
-	pd     int
+	pd     int   // replies pending from Send
+	state  uint8 // session state changed by commands, see track
+	ends   uint8 // states the reply endsIn replies from now ends, see endOnSuccess
+	endsIn int
 	lease  atomic.Uint64 // counts the PoolConn borrows put back, see PoolConn.Close
 
 	createdAt time.Time // set by the Pool that dialed the conn
@@ -95,7 +99,7 @@ func (c *Conn) Do(cmd string, args ...any) (*Reply, error) {
 // first RedisErr among them is returned after the reply of the command has
 // been read, so the conn stays in sync.
 func (c *Conn) roundtrip(cmd string, args []any, reply *Reply) error {
-	if err := c.Send(cmd, args...); err != nil {
+	if err := c.send(cmd, args, true); err != nil {
 		return err
 	}
 	var pending error
@@ -119,11 +123,24 @@ func (c *Conn) roundtrip(cmd string, args []any, reply *Reply) error {
 // Send returns errInvalidArgType without touching the connection if an arg
 // has an unsupported type.
 func (c *Conn) Send(cmd string, args ...any) error {
+	return c.send(cmd, args, false)
+}
+
+// send is Send, for Do if do is true. Do relies on one reply per command,
+// so it rejects the commands after which redis pushes replies of its own,
+// pub/sub and MONITOR, and any command on a conn that sent one.
+func (c *Conn) send(cmd string, args []any, do bool) error {
 	if err := c.Err(); err != nil {
 		return err
 	}
 	n, size, err := argsInfo(args)
 	if err != nil {
+		return err
+	}
+	if do && c.state&statePush != 0 {
+		return errPush
+	}
+	if err := c.track(cmd, n, args, do); err != nil {
 		return err
 	}
 	c.pd++
@@ -205,13 +222,20 @@ func (c *Conn) recv(reply *Reply) error {
 		return err // reply is left alone
 	}
 	reply.Reset()
-	c.pd--
+	if c.pd > 0 {
+		c.pd-- // a reply without a Send is a pushed message, like pub/sub
+	}
 	c.br.reclaim()
 	c.br.disarm() // the read timeout covers this reply only
 	if err := c.read(reply, 0); err != nil {
 		return c.seterr(err)
 	}
 	c.br.drop()
+	if c.endsIn > 0 {
+		if c.endsIn--; c.endsIn == 0 && reply.t != typeError && !reply.queued() {
+			c.state &^= c.ends // EXEC, DISCARD or UNWATCH ran
+		}
+	}
 	return nil
 }
 
@@ -486,4 +510,188 @@ func (c *Conn) DoInteger(cmd string, args ...any) (int64, error) {
 	i, err := r.Integer()
 	c.done(false, err)
 	return i, err
+}
+
+// Session states set by commands. A Pool closes a conn in any of them
+// instead of handing it to the next caller.
+const (
+	stateMulti   uint8 = 1 << iota // after MULTI, until EXEC or DISCARD
+	stateWatch                     // after WATCH, until EXEC, DISCARD or UNWATCH
+	stateChanged                   // after SELECT, CLIENT, ..., for good
+	statePush                      // after a pub/sub command or MONITOR, for good
+)
+
+// track updates the session state of c for cmd with args, which expand to
+// n bulk strings, or rejects cmd. It runs on
+// every Send, so it rejects most commands on their length, inline, and
+// first letter.
+//
+// States are set as soon as a command is sent, but only cleared by the
+// successful reply of EXEC or DISCARD without args in a transaction, or
+// of UNWATCH without args that was not queued in one. Otherwise the state
+// stays and the conn is not reused.
+//
+// A pub/sub command or MONITOR puts c in statePush, or fails for Do.
+// CLIENT and SCRIPT are tracked by their subcommand.
+func (c *Conn) track(cmd string, n int, args []any, do bool) error {
+	if len(cmd) >= 4 && len(cmd) <= 12 {
+		return c.track4(cmd, n, args, do)
+	}
+	return nil
+}
+
+func (c *Conn) track4(cmd string, n int, args []any, do bool) error {
+	switch cmd[0] | 0x20 { // lower case
+	case 'a':
+		c.change(cmd, "AUTH", "ASKING")
+	case 'c':
+		if is(cmd, "CLIENT") {
+			return c.client(args)
+		}
+	case 'd':
+		if is(cmd, "DISCARD") {
+			c.endMulti(n)
+		}
+	case 'e':
+		if is(cmd, "EXEC") {
+			c.endMulti(n)
+		}
+	case 'h':
+		c.change(cmd, "HELLO")
+	case 'm':
+		if is(cmd, "MULTI") {
+			c.state |= stateMulti
+			c.keep(stateMulti) // a pending end would not cover this transaction
+		} else if is(cmd, "MONITOR") {
+			return c.push(do)
+		}
+	case 'p', 's', 'u':
+		if isAny(cmd, "SUBSCRIBE", "PSUBSCRIBE", "SSUBSCRIBE",
+			"UNSUBSCRIBE", "PUNSUBSCRIBE", "SUNSUBSCRIBE") {
+			return c.push(do)
+		} else if is(cmd, "SELECT") {
+			c.state |= stateChanged
+		} else if is(cmd, "SCRIPT") {
+			if sub, _ := nthArg(args, 0); is(sub, "DEBUG") {
+				c.state |= stateChanged // scripts of the conn run in the debugger
+			}
+		} else if is(cmd, "UNWATCH") && n == 0 {
+			// run, not queued, it shows the transaction ended too
+			c.endOnSuccess(stateMulti | stateWatch)
+		}
+	case 'q':
+		c.change(cmd, "QUIT")
+	case 'r':
+		c.change(cmd, "RESET", "READONLY", "READWRITE")
+	case 'w':
+		if is(cmd, "WATCH") {
+			c.state |= stateWatch
+			c.keep(stateWatch) // a pending end would not cover this watch
+		}
+	}
+	return nil
+}
+
+// push handles a command after which redis pushes messages without being
+// asked: the pending count no longer tells which reply belongs to Do.
+func (c *Conn) push(do bool) error {
+	if do {
+		return errPush
+	}
+	c.state |= statePush
+	return nil
+}
+
+// client tracks CLIENT by its subcommand. The read-only ones leave the
+// session alone. REPLY OFF and SKIP are rejected, since replies would no
+// longer match commands. The others, like SETNAME or TRACKING, change it.
+func (c *Conn) client(args []any) error {
+	sub, _ := nthArg(args, 0)
+	switch {
+	case isAny(sub, "ID", "INFO", "LIST", "GETNAME", "GETREDIR", "TRACKINGINFO"):
+	case is(sub, "REPLY"):
+		if mode, _ := nthArg(args, 1); !is(mode, "ON") {
+			return errClientReply
+		}
+	default:
+		c.state |= stateChanged
+	}
+	return nil
+}
+
+// nthArg returns the i-th bulk string args expand to, if it is a string.
+func nthArg(args []any, i int) (string, bool) {
+	for _, a := range args {
+		switch v := a.(type) {
+		case string:
+			if i == 0 {
+				return v, true
+			}
+			i--
+		case []byte:
+			if i == 0 {
+				return ss(v), true
+			}
+			i--
+		case []string:
+			if i < len(v) {
+				return v[i], true
+			}
+			i -= len(v)
+		default:
+			if i == 0 {
+				return "", false
+			}
+			i--
+		}
+	}
+	return "", false
+}
+
+// endMulti handles EXEC or DISCARD with n args, which end a transaction
+// and the watches before it. Outside of a transaction, or with args, redis
+// rejects them and keeps the watches.
+func (c *Conn) endMulti(n int) {
+	if n == 0 && c.state&stateMulti != 0 {
+		c.endOnSuccess(stateMulti | stateWatch)
+	}
+}
+
+// endOnSuccess makes the reply of the command being sent clear states,
+// unless it is an error, as redis may still reject the command, without
+// permission for it for example, or QUEUED. Only the last such command is
+// followed: it shows the earlier ones ran, or the state stays.
+func (c *Conn) endOnSuccess(states uint8) {
+	c.ends = states
+	c.endsIn = c.pd + 1 // the command is not counted yet
+}
+
+// keep makes the pending end, if any, leave states set by the command being
+// sent, which it would not cover.
+func (c *Conn) keep(states uint8) {
+	if c.ends &^= states; c.ends == 0 {
+		c.endsIn = 0
+	}
+}
+
+// change marks the session of c as changed if cmd is one of names.
+func (c *Conn) change(cmd string, names ...string) {
+	if isAny(cmd, names...) {
+		c.state |= stateChanged
+	}
+}
+
+// isAny reports whether cmd is one of names, ignoring case.
+func isAny(cmd string, names ...string) bool {
+	for _, name := range names {
+		if is(cmd, name) {
+			return true
+		}
+	}
+	return false
+}
+
+// is reports whether cmd is name, ignoring case.
+func is(cmd, name string) bool {
+	return len(cmd) == len(name) && strings.EqualFold(cmd, name)
 }

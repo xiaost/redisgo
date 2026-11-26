@@ -89,6 +89,9 @@ func main() {
   so the connection reuses the buffer for replies up to 64KB, and they allocate nothing but the returned string.
   Prefer them unless you need zero-copy bytes.
 - Call `Reply.Free` exactly once per `Reply` returned by `Do`.
+- The pool never hands out a conn whose session was changed:
+  a conn after `SELECT`, `AUTH`, `SUBSCRIBE`, `CLIENT SETNAME`, ..., or an unfinished `MULTI` or `WATCH`, is closed instead of reused.
+  Authenticate and select the database in the `DialFunc`.
 - `PoolConn.Close` detaches the conn: a `PoolConn` used after `Close` returns `ErrClosed`
   instead of touching a conn that someone else may have borrowed since.
 - A nil bulk string (`GET` of a missing key) and a nil array (`BLPOP` on timeout, an aborted `EXEC`)
@@ -96,4 +99,6 @@ func main() {
 - `Do` and the `DoXxx` helpers first receive and drop the replies still pending from `Send`,
   like redigo, so `Send("MULTI")`, `Send(...)`, `Do("EXEC")` returns the reply of `EXEC`.
   If a dropped reply is an error, the first one is returned instead.
+- After pub/sub commands and `MONITOR` redis pushes replies of its own, so they need `Send` and `Recv`:
+  `Do` rejects them, and any command on a conn that sent one, even in the `DialFunc`.
 - Bulk strings and arrays longer than 512MB (the default `proto-max-bulk-len` of redis) are rejected as a protocol error.

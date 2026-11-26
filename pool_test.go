@@ -552,6 +552,170 @@ func TestDeadlineErrorIsFatal(t *testing.T) {
 	}
 }
 
+func TestPoolClosesChangedSessions(t *testing.T) {
+	var dials atomic.Int32
+	p := NewPool(func(ctx context.Context) (*Conn, error) {
+		dials.Add(1)
+		c := NewConn(&FakeConn{reply: []byte("+OK\r\n")}, WithReadTimeout(0), WithWriteTimeout(0))
+		// set up by DialFunc: part of the base state
+		return c, c.DoNoReply("select", 1)
+	}, WithMaxIdle(1))
+	defer p.Close()
+	ctx := context.Background()
+	// the first case dials: SELECT in DialFunc must not discard the conn
+	kept := func(name string, want bool, cmds ...string) {
+		t.Helper()
+		c, err := p.Get(ctx)
+		if err != nil {
+			t.Fatal(err)
+		}
+		var r Reply
+		for _, cmd := range cmds {
+			if err := c.Send(cmd); err != nil {
+				t.Fatal(err)
+			}
+			if err := c.Recv(&r); err != nil {
+				t.Fatal(err)
+			}
+		}
+		c.Close()
+		if got := p.Idle() == 1; got != want {
+			t.Errorf("%s: expect conn kept %v, got %v", name, want, got)
+		}
+	}
+	kept("plain", true, "PING", "GET", "HSET")
+	kept("transaction", true, "MULTI", "INCR", "EXEC")
+	kept("discarded transaction", true, "multi", "INCR", "Discard")
+	kept("watch", true, "WATCH", "UNWATCH")
+	kept("watch and exec", true, "WATCH", "MULTI", "EXEC")
+	kept("open transaction", false, "MULTI", "INCR")
+	kept("open watch", false, "WATCH")
+	kept("watch and discard without multi", false, "WATCH", "DISCARD")
+	kept("watch and exec without multi", false, "WATCH", "EXEC")
+	kept("select", false, "SELECT")
+	kept("subscribe", false, "SUBSCRIBE")
+	kept("unsubscribe", false, "UNSUBSCRIBE")
+	kept("punsubscribe", false, "punsubscribe")
+	kept("client", false, "CLIENT")
+	kept("auth", false, "auth")
+	kept("quit", false, "QUIT")
+
+	// redis rejects DISCARD with args and keeps the transaction open
+	c, _ := p.Get(ctx)
+	c.DoNoReply("MULTI")
+	c.DoNoReply("DISCARD", "extra")
+	c.Close()
+	if p.Idle() != 0 {
+		t.Error("conn kept after a rejected DISCARD")
+	}
+
+	// the same through the helpers
+	if err := p.DoNoReply(ctx, "SELECT", 2); err != nil {
+		t.Fatal(err)
+	}
+	if p.Idle() != 0 {
+		t.Fatal("conn kept after SELECT")
+	}
+	if err := p.DoNoReply(ctx, "PING"); err != nil || p.Idle() != 1 {
+		t.Fatal(err, p.Idle())
+	}
+	// the first conn, one after each of the 13 discarded conns
+	if n := dials.Load(); n != 14 {
+		t.Fatalf("expect 14 dials, got %d", n)
+	}
+}
+
+// TestPubSubKeepsPendingCount checks that replies pushed without a Send,
+// like pub/sub messages, do not desync later commands.
+func TestPubSubKeepsPendingCount(t *testing.T) {
+	sub := tcmd(tstr("subscribe"), tstr("a"), ":1\r\n") + tcmd(tstr("subscribe"), tstr("b"), ":2\r\n")
+	unsub := tcmd(tstr("unsubscribe"), tstr("a"), ":1\r\n") + tcmd(tstr("unsubscribe"), tstr("b"), ":0\r\n")
+	c := newTestConn(sub+unsub+"+PONG\r\n"+tstr("x"), 0)
+	var r Reply
+	c.Send("SUBSCRIBE", "a", "b")
+	c.Recv(&r)
+	c.Recv(&r)
+	c.Send("UNSUBSCRIBE")
+	c.Recv(&r)
+	c.Recv(&r)
+	if c.pd != 0 {
+		t.Fatal(c.pd)
+	}
+	// Do relies on one reply per command, which pub/sub breaks
+	if _, err := c.DoString("ECHO", "x"); err != errPush {
+		t.Fatal(err)
+	}
+	c.Send("PING")
+	if err := c.Recv(&r); err != nil {
+		t.Fatal(err)
+	}
+	if b, _ := r.Bytes(); string(b) != "PONG" {
+		t.Fatalf("expect PONG, got %q", b)
+	}
+}
+
+// TestDoRejectsPubSub checks that pub/sub commands, which reply once per
+// channel, cannot go through Do and leave replies to the next caller.
+func TestDoRejectsPubSub(t *testing.T) {
+	p := NewPool(func(ctx context.Context) (*Conn, error) {
+		return NewConn(&FakeConn{reply: []byte("+OK\r\n")}, WithReadTimeout(0), WithWriteTimeout(0)), nil
+	})
+	defer p.Close()
+	ctx := context.Background()
+	for _, cmd := range []string{"SUBSCRIBE", "psubscribe", "SSUBSCRIBE", "UNSUBSCRIBE", "PUNSUBSCRIBE", "SUNSUBSCRIBE"} {
+		if err := p.DoNoReply(ctx, cmd, "a", "b"); err != errPush {
+			t.Errorf("%s: expect errPush, got %v", cmd, err)
+		}
+	}
+	// nothing was sent, the conn is still clean and reused
+	if err := p.DoNoReply(ctx, "PING"); err != nil || p.Idle() != 1 || p.Active() != 1 {
+		t.Fatal(err, p.Idle(), p.Active())
+	}
+}
+
+func TestPoolTracksSubcommands(t *testing.T) {
+	var dials atomic.Int32
+	p := NewPool(func(ctx context.Context) (*Conn, error) {
+		dials.Add(1)
+		return NewConn(&FakeConn{reply: []byte("+OK\r\n")}, WithReadTimeout(0), WithWriteTimeout(0)), nil
+	}, WithMaxIdle(1))
+	defer p.Close()
+	ctx := context.Background()
+	for _, tc := range []struct {
+		args []any
+		kept bool
+	}{
+		{[]any{"CLIENT", "ID"}, true},
+		{[]any{"client", "getname"}, true},
+		{[]any{"CLIENT", "LIST", "TYPE", "normal"}, true},
+		{[]any{"CLIENT", "REPLY", "ON"}, true},
+		{[]any{"SCRIPT", "LOAD", "return 1"}, true},
+		{[]any{"CLIENT", "SETNAME", "x"}, false},
+		{[]any{"CLIENT", []string{"TRACKING", "ON"}}, false},
+		{[]any{"SCRIPT", "debug", "yes"}, false},
+		{[]any{"ASKING"}, false},
+	} {
+		if err := p.DoNoReply(ctx, tc.args[0].(string), tc.args[1:]...); err != nil {
+			t.Fatal(tc.args, err)
+		}
+		if got := p.Idle() == 1; got != tc.kept {
+			t.Errorf("%v: expect conn kept %v, got %v", tc.args, tc.kept, got)
+		}
+	}
+	if err := p.DoNoReply(ctx, "PING"); err != nil { // park a conn again
+		t.Fatal(err)
+	}
+	n := dials.Load()
+	for _, args := range [][]any{{"REPLY", "OFF"}, {"reply", "skip"}, {[]string{"REPLY", "OFF"}}, {"REPLY"}} {
+		if err := p.DoNoReply(ctx, "CLIENT", args...); err != errClientReply {
+			t.Errorf("CLIENT %v: expect errClientReply, got %v", args, err)
+		}
+	}
+	if dials.Load() != n || p.Idle() != 1 {
+		t.Fatal("a rejected CLIENT REPLY touched the conn")
+	}
+}
+
 // writeCountConn counts writes.
 type writeCountConn struct {
 	FakeConn
@@ -595,6 +759,90 @@ func TestPoolDialAfterClose(t *testing.T) {
 	}
 }
 
+// TestPoolEndsStateOnSuccess checks that EXEC, DISCARD and UNWATCH only end
+// a transaction or watches when redis accepts them.
+func TestPoolEndsStateOnSuccess(t *testing.T) {
+	for _, tc := range []struct {
+		name    string
+		cmds    []string
+		replies string
+		kept    bool
+	}{
+		{"exec", []string{"MULTI", "SET", "EXEC"}, "+OK\r\n+QUEUED\r\n*1\r\n+OK\r\n", true},
+		{"aborted exec", []string{"WATCH", "MULTI", "EXEC"}, "+OK\r\n+OK\r\n*-1\r\n", true},
+		{"discard", []string{"MULTI", "DISCARD"}, "+OK\r\n+OK\r\n", true},
+		{"unwatch", []string{"WATCH", "UNWATCH"}, "+OK\r\n+OK\r\n", true},
+		{"discard without permission", []string{"MULTI", "DISCARD"}, "+OK\r\n-NOPERM no permission\r\n", false},
+		{"exec abort", []string{"MULTI", "BAD", "EXEC"}, "+OK\r\n-ERR unknown\r\n-EXECABORT discarded\r\n", false},
+		{"watch after exec", []string{"MULTI", "EXEC", "WATCH"}, "+OK\r\n*0\r\n+OK\r\n", false},
+	} {
+		for _, pipelined := range []bool{false, true} {
+			p := NewPool(func(ctx context.Context) (*Conn, error) {
+				return newTestConn(tc.replies, 0), nil
+			})
+			c, _ := p.Get(context.Background())
+			if pipelined {
+				var r Reply
+				for _, cmd := range tc.cmds {
+					c.Send(cmd)
+				}
+				for range tc.cmds {
+					if err := c.Recv(&r); err != nil {
+						t.Fatal(err)
+					}
+				}
+			} else {
+				for _, cmd := range tc.cmds {
+					c.DoNoReply(cmd)
+				}
+			}
+			c.Close()
+			if got := p.Idle() == 1; got != tc.kept {
+				t.Errorf("%s (pipelined %v): expect conn kept %v, got %v", tc.name, pipelined, tc.kept, got)
+			}
+		}
+	}
+}
+
+// TestPoolPushConns checks conns that redis pushes messages to: one
+// subscribed by DialFunc, and one that sent MONITOR.
+func TestPoolPushConns(t *testing.T) {
+	ctx := context.Background()
+	p := NewPool(func(ctx context.Context) (*Conn, error) {
+		msgs := tcmd(tstr("subscribe"), tstr("a"), ":1\r\n") + tcmd(tstr("message"), tstr("a"), tstr("hi"))
+		c := newTestConn(msgs, 0)
+		c.Send("SUBSCRIBE", "a")
+		var r Reply
+		return c, c.Recv(&r)
+	})
+	defer p.Close()
+	if err := p.DoNoReply(ctx, "SET", "k", "v"); err != errPush {
+		t.Fatalf("expect errPush on a subscribed conn, got %v", err)
+	}
+	if p.Idle() != 0 {
+		t.Fatal("subscribed conn pooled")
+	}
+	pc, _ := p.Get(ctx)
+	var r Reply
+	if err := pc.Recv(&r); err != nil {
+		t.Fatal(err)
+	}
+	if aa, _ := r.Array(); len(aa) != 3 || string(aa[2].b) != "hi" {
+		t.Fatalf("expect the message, got %v", aa)
+	}
+	pc.Close()
+
+	c := newTestConn("+OK\r\n+1700000000.0 [0 127.0.0.1:1] \"PING\"\r\n", 0)
+	if err := c.DoNoReply("MONITOR"); err != errPush {
+		t.Fatalf("expect errPush for MONITOR, got %v", err)
+	}
+	c.Send("MONITOR")
+	c.Recv(&r)
+	if _, err := c.DoString("PING"); err != errPush {
+		t.Fatalf("expect errPush after MONITOR, got %v", err)
+	}
+}
+
 // closeHookConn runs onClose when closed.
 type closeHookConn struct {
 	writeCountConn
@@ -631,6 +879,62 @@ func TestPoolCtxDoneWhileClosingExpired(t *testing.T) {
 	}
 	if conns[1].writes != 0 || p.Idle() != 1 {
 		t.Fatal("command sent for a canceled ctx", conns[1].writes, p.Idle())
+	}
+}
+
+// TestPoolEndsStateInPipelines checks pipelines that end a transaction and
+// watches in more than one step.
+func TestPoolEndsStateInPipelines(t *testing.T) {
+	for _, tc := range []struct {
+		name    string
+		cmds    [][]any
+		replies string
+		kept    bool
+	}{
+		{"exec then watch, unwatch", [][]any{{"MULTI"}, {"EXEC"}, {"WATCH", "k"}, {"UNWATCH"}}, "+OK\r\n*0\r\n+OK\r\n+OK\r\n", true},
+		{"unwatch queued", [][]any{{"WATCH", "k"}, {"MULTI"}, {"UNWATCH"}}, "+OK\r\n+OK\r\n+QUEUED\r\n", false},
+		{"multi after unwatch", [][]any{{"UNWATCH"}, {"MULTI"}}, "+OK\r\n+OK\r\n", false},
+		{"watch after unwatch", [][]any{{"UNWATCH"}, {"WATCH", "k"}}, "+OK\r\n+OK\r\n", false},
+		{"multi after exec", [][]any{{"WATCH", "k"}, {"MULTI"}, {"EXEC"}, {"MULTI"}}, "+OK\r\n+OK\r\n*0\r\n+OK\r\n", false},
+		{"watch after exec", [][]any{{"MULTI"}, {"EXEC"}, {"WATCH", "k"}}, "+OK\r\n*0\r\n+OK\r\n", false},
+		{"exec rejected", [][]any{{"MULTI"}, {"EXEC"}, {"UNWATCH"}}, "+OK\r\n-NOPERM no\r\n+QUEUED\r\n", false},
+	} {
+		p := NewPool(func(ctx context.Context) (*Conn, error) {
+			return newTestConn(tc.replies, 0), nil
+		})
+		c, _ := p.Get(context.Background())
+		var r Reply
+		for _, cmd := range tc.cmds {
+			c.Send(cmd[0].(string), cmd[1:]...)
+		}
+		for range tc.cmds {
+			if err := c.Recv(&r); err != nil {
+				t.Fatal(err)
+			}
+		}
+		c.Close()
+		if got := p.Idle() == 1; got != tc.kept {
+			t.Errorf("%s: expect conn kept %v, got %v", tc.name, tc.kept, got)
+		}
+	}
+}
+
+// TestPoolDialedTransaction checks that a conn DialFunc left in a
+// transaction is not reused once a borrower ends it, as it would no longer
+// be in the state DialFunc set up.
+func TestPoolDialedTransaction(t *testing.T) {
+	dials := 0
+	p := NewPool(func(ctx context.Context) (*Conn, error) {
+		dials++
+		c := newTestConn("+OK\r\n+OK\r\n", 0)
+		return c, c.DoNoReply("MULTI")
+	})
+	defer p.Close()
+	if err := p.DoNoReply(context.Background(), "DISCARD"); err != nil {
+		t.Fatal(err)
+	}
+	if p.Idle() != 0 {
+		t.Fatal("conn reused out of the transaction DialFunc started")
 	}
 }
 

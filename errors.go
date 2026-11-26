@@ -13,6 +13,8 @@ var (
 	errProtocol       = errors.New("redisgo: protocol err")
 	errTypeMismatch   = errors.New("redisgo: type mismatch")
 	errInvalidArgType = errors.New("redisgo: invalid args type")
+	errPush           = errors.New("redisgo: pub/sub and MONITOR need Send and Recv, not Do")
+	errClientReply    = errors.New("redisgo: CLIENT REPLY OFF and SKIP are not supported")
 )
 
 // RedisErr represents a server side err

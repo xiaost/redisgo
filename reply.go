@@ -51,6 +51,12 @@ func (r *Reply) Reset() {
 	r.reset(false)
 }
 
+// queued reports whether r is the QUEUED status of a command in a
+// transaction.
+func (r *Reply) queued() bool {
+	return r.t == typeSString && string(r.b) == "QUEUED"
+}
+
 // IsNil returns true if redis replied a "Null Bulk String" or a "Null Array",
 // such as GET of a missing key, BLPOP on timeout or EXEC of an aborted
 // transaction. The getters return ErrNil for both.
