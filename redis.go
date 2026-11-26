@@ -12,20 +12,22 @@ import (
 // A Conn is not safe for concurrent use. Use a Pool to hand one Conn to
 // each goroutine.
 //
-// Byte slices returned through Reply alias the read buffer of the Conn.
-// They stay valid after Reply.Free, but keeping one alive keeps the whole
-// buffer alive, so copy values that are retained for long.
+// Byte slices returned through Reply, DoBytes, DoBytesSlice and RedisErr
+// alias the read buffer of the Conn. They stay valid after Reply.Free, but
+// keeping one alive keeps the whole buffer alive, so copy values that are
+// retained for long. DoString, DoInteger and DoNoReply return nothing that
+// aliases the buffer (except a RedisErr), which lets the Conn reuse it.
 type Conn struct {
-	conn net.Conn
-	br   *reader
-	bw   *bufio.Writer
-	cmd  []byte // scratch for commands larger than bw
+	conn  net.Conn
+	br    *reader
+	bw    *bufio.Writer
+	cmd   []byte // scratch for commands larger than bw
+	reply Reply  // scratch for the DoXxx helpers, see do
 
 	err    error
 	closed bool
 	pd     int
 
-	rtimeout time.Duration
 	wtimeout time.Duration
 }
 
@@ -38,15 +40,15 @@ func NewConn(conn net.Conn, ops ...Option) *Conn {
 	var r Conn
 	r.conn = conn
 	r.br = newReader(conn, o.rbuf)
+	r.br.timeout = o.rtimeout
 	r.bw = bufio.NewWriterSize(conn, o.wbuf)
-	r.rtimeout = o.rtimeout
 	r.wtimeout = o.wtimeout
 	return &r
 }
 
 // SetReadTimeout sets the read timeout of underlying connection
 func (c *Conn) SetReadTimeout(t time.Duration) {
-	c.rtimeout = t
+	c.br.timeout = t
 }
 
 // SetWriteTimeout sets the write timeout of underlying connection
@@ -121,15 +123,26 @@ func (c *Conn) Flush() error {
 
 // Recv receives reply from redis
 func (c *Conn) Recv(reply *Reply) error {
-	reply.Reset()
+	err := c.recv(reply)
+	c.br.expose() // reply aliases the read buffer from now on
+	return err
+}
+
+// recv is Recv without exposing reply: the buffer space of reply is reused
+// by later replies unless c.br.expose is called before the next recv.
+func (c *Conn) recv(reply *Reply) error {
 	if err := c.Flush(); err != nil {
-		return err
+		return err // reply is left alone
 	}
+	reply.Reset()
 	c.pd--
-	if c.rtimeout > 0 {
-		c.conn.SetReadDeadline(time.Now().Add(c.rtimeout))
+	c.br.reclaim()
+	c.br.disarm() // the read timeout covers this reply only
+	if err := c.read(reply); err != nil {
+		return c.seterr(err)
 	}
-	return c.seterr(c.read(reply))
+	c.br.drop()
+	return nil
 }
 
 // Conn returns the underlying net.Conn
@@ -183,10 +196,48 @@ const maxLen = 512 << 20
 // single header, so a bogus header cannot trigger a huge allocation.
 const maxArrayPrealloc = 1024
 
+// parseInt parses a RESP integer: an optional '+' or '-' followed by
+// digits. Up to 18 characters it cannot overflow, which covers every length
+// and most integers, so the loop skips the generality of strconv.ParseInt.
+func parseInt(b []byte) (int64, error) {
+	if len(b) > 18 {
+		n, err := strconv.ParseInt(ss(b), 10, 64)
+		if err != nil {
+			return 0, errProtocol
+		}
+		return n, nil
+	}
+	d := b
+	if len(d) > 0 && (d[0] == '-' || d[0] == '+') {
+		d = d[1:]
+	}
+	if len(d) == 0 {
+		return 0, errProtocol
+	}
+	var n int64
+	for _, c := range d {
+		if c < '0' || c > '9' {
+			return 0, errProtocol
+		}
+		n = n*10 + int64(c-'0')
+	}
+	if b[0] == '-' {
+		n = -n
+	}
+	return n, nil
+}
+
 // parseLen parses the length field of a bulk string or array header.
-// -1 is valid and denotes a nil value.
+// -1 is valid and denotes a nil value. Unlike integers, lengths take no
+// sign otherwise, so -0 or -01 are not valid either.
 func parseLen(b []byte) (int, error) {
-	n, err := strconv.ParseInt(ss(b), 10, 64)
+	if len(b) > 0 && b[0] < '0' { // a sign
+		if string(b) == "-1" {
+			return -1, nil
+		}
+		return 0, errProtocol
+	}
+	n, err := parseInt(b)
 	if err != nil || n < -1 || n > maxLen {
 		return 0, errProtocol
 	}
@@ -227,8 +278,8 @@ func (c *Conn) read(r *Reply) (err error) {
 		r.b = r.b[:n:n]
 		r.t = typeBString
 	case ':': // Integers
-		if r.i, err = strconv.ParseInt(ss(b), 10, 64); err != nil {
-			return errProtocol
+		if r.i, err = parseInt(b); err != nil {
+			return
 		}
 		r.t = typeInteger
 	case '*': // Arrays
@@ -241,7 +292,10 @@ func (c *Conn) read(r *Reply) (err error) {
 		}
 		if r.array == nil || cap(r.array) < n {
 			r.array = make([]Reply, 0, min(n, maxArrayPrealloc))
+		} else {
+			r.unhide(n) // the elements left are not reused
 		}
+		r.hide = uint32(n) // n <= maxLen
 		for i := 0; i < n; i++ {
 			if i < cap(r.array) {
 				// reuse the element, its nested array keeps its capacity.
@@ -256,66 +310,93 @@ func (c *Conn) read(r *Reply) (err error) {
 		}
 		r.t = typeArray
 	case '-': // Errors
+		r.b = b
 		r.t = typeError
-		r.err = RedisErr(b)
 	default:
 		err = errProtocol
 	}
 	return
 }
 
+// do sends a command and reads its reply into the scratch reply of c,
+// which saves the pool round trip of Do. The caller must call done.
+func (c *Conn) do(cmd string, args []any) (*Reply, error) {
+	if err := c.Send(cmd, args...); err != nil {
+		return nil, err
+	}
+	if err := c.recv(&c.reply); err != nil {
+		return nil, err
+	}
+	return &c.reply, nil
+}
+
+// done releases the scratch reply. Unless exposed, its space in the read
+// buffer is reused, so the caller must have copied what it returns.
+// A RedisErr aliases the buffer and always exposes the reply.
+func (c *Conn) done(exposed bool, err error) {
+	if _, ok := err.(RedisErr); ok || exposed {
+		c.br.expose()
+	}
+	c.reply.release()
+}
+
 // DoNoReply wraps Do() and Reply.Err()
 func (c *Conn) DoNoReply(cmd string, args ...any) error {
-	reply, err := c.Do(cmd, args...)
+	r, err := c.do(cmd, args)
 	if err != nil {
 		return err
 	}
-	defer reply.Free()
-	return reply.Err()
+	err = r.Err()
+	c.done(false, err)
+	return err
 }
 
-// DoBytes wraps Do() and Reply.Bytes()
+// DoBytes wraps Do() and Reply.Bytes().
+// The result aliases the read buffer, see Conn; use DoString for a copy.
 func (c *Conn) DoBytes(cmd string, args ...any) ([]byte, error) {
-	reply, err := c.Do(cmd, args...)
+	r, err := c.do(cmd, args)
 	if err != nil {
 		return nil, err
 	}
-	defer reply.Free()
-	return reply.Bytes()
+	b, err := r.Bytes()
+	c.done(true, err)
+	return b, err
 }
 
-// DoBytesSlice wraps Do() and reply.Array() and reply.Bytes()
+// DoString wraps Do() and Reply.Bytes(), and copies the result into a string.
+// Unlike DoBytes, the result is safe to retain, and the Conn reuses the
+// buffer space of the reply instead of allocating new buffers.
+func (c *Conn) DoString(cmd string, args ...any) (string, error) {
+	r, err := c.do(cmd, args)
+	if err != nil {
+		return "", err
+	}
+	b, err := r.Bytes()
+	s := string(b)
+	c.done(false, err)
+	return s, err
+}
+
+// DoBytesSlice wraps Do() and reply.Array() and reply.Bytes().
+// "Null Bulk String" elements are nil, and a "Null Array" returns nil.
+// The elements alias the read buffer, see Conn.
 func (c *Conn) DoBytesSlice(cmd string, args ...any) ([][]byte, error) {
-	reply, err := c.Do(cmd, args...)
+	r, err := c.do(cmd, args)
 	if err != nil {
 		return nil, err
 	}
-	defer reply.Free()
-	aa, err := reply.Array()
-	if err != nil {
-		return nil, err
-	}
-	ret := make([][]byte, 0, len(aa))
-	for i := range aa {
-		if aa[i].IsNil() {
-			ret = append(ret, []byte(nil))
-			continue
-		}
-		b, err := aa[i].Bytes()
-		if err != nil {
-			return nil, err
-		}
-		ret = append(ret, b)
-	}
-	return ret, nil
+	bb, err := r.bytesSlice()
+	c.done(true, err)
+	return bb, err
 }
 
 // DoInteger wraps Do() and reply.Integer()
 func (c *Conn) DoInteger(cmd string, args ...any) (int64, error) {
-	reply, err := c.Do(cmd, args...)
+	r, err := c.do(cmd, args)
 	if err != nil {
 		return 0, err
 	}
-	defer reply.Free()
-	return reply.Integer()
+	i, err := r.Integer()
+	c.done(false, err)
+	return i, err
 }

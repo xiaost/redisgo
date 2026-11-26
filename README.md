@@ -79,5 +79,8 @@ func main() {
   alias the read buffer of the connection.
   They stay valid after `Reply.Free`, but keeping one alive keeps the whole buffer alive,
   so copy values that you retain for long.
+- `DoString`, `DoInteger` and `DoNoReply` return nothing that aliases the read buffer (except a `RedisErr`),
+  so the connection reuses the buffer for replies up to 64KB, and they allocate nothing but the returned string.
+  Prefer them unless you need zero-copy bytes.
 - Call `Reply.Free` exactly once per `Reply` returned by `Do`.
 - Bulk strings and arrays longer than 512MB (the default `proto-max-bulk-len` of redis) are rejected as a protocol error.

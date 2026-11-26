@@ -4,7 +4,7 @@ import (
 	"sync"
 )
 
-type replyType int
+type replyType uint8
 
 const (
 	typeUnset replyType = iota
@@ -19,11 +19,11 @@ const (
 
 // Reply represents a reply of redis
 type Reply struct {
-	p     bool
 	t     replyType
-	b     []byte
+	p     bool   // from replyPool
+	hide  uint32 // array[:hide] may keep nested arrays, see unhide
+	b     []byte // text of simple strings, bulk strings and errors
 	i     int64
-	err   RedisErr
 	array []Reply
 }
 
@@ -40,16 +40,16 @@ func NewReply() *Reply {
 	return replyPool.Get().(*Reply)
 }
 
-// Reset resets fields of Reply
+// maxNested bounds the elements kept by the arrays nested in a reply for
+// reuse, all together, so that many arrays each within maxArrayPrealloc
+// do not pin a huge reply either.
+const maxNested = 4 * maxArrayPrealloc
+
+// Reset resets fields of Reply. It keeps the array for reuse, and the
+// arrays nested in it, except the ones larger than maxArrayPrealloc, or
+// all of them if together they keep more than maxNested elements.
 func (r *Reply) Reset() {
-	r.t = typeUnset
-	r.b = nil // never reuse it, it aliases the read buffer
-	r.i = 0
-	r.err = nil // aliases the read buffer as well
-	for i := range r.array {
-		r.array[i].Reset() // remove ref for gc friendly
-	}
-	r.array = r.array[:0]
+	r.reset(false)
 }
 
 // IsNil returns true if redis response a "Null Bulk String"
@@ -68,11 +68,8 @@ func (r *Reply) IsOK() bool {
 //
 // The returned slice aliases the read buffer of the Conn, see Conn.
 func (r *Reply) Bytes() ([]byte, error) {
-	if err := r.Err(); err != nil {
-		return nil, err
-	}
 	if r.t != typeSString && r.t != typeBString {
-		return nil, errTypeMismatch
+		return nil, r.mismatch()
 	}
 	return r.b, nil
 }
@@ -80,11 +77,8 @@ func (r *Reply) Bytes() ([]byte, error) {
 // Integer returns int64 of integer protocol:
 // https://redis.io/topics/protocol#resp-integers
 func (r *Reply) Integer() (int64, error) {
-	if err := r.Err(); err != nil {
-		return 0, err
-	}
 	if r.t != typeInteger {
-		return 0, errTypeMismatch
+		return 0, r.mismatch()
 	}
 	return r.i, nil
 }
@@ -92,27 +86,51 @@ func (r *Reply) Integer() (int64, error) {
 // Array returns []Reply of array protocol:
 // https://redis.io/topics/protocol#resp-arrays
 func (r *Reply) Array() ([]Reply, error) {
-	if err := r.Err(); err != nil {
-		return nil, err
-	}
-	if r.t != typeArray && r.t != typeNilArray {
-		return nil, errTypeMismatch
-	}
-	if r.t == typeNilArray {
+	switch r.t {
+	case typeArray:
+		return r.array, nil
+	case typeNilArray:
 		return nil, nil
 	}
-	return r.array, nil
+	return nil, r.mismatch()
 }
 
 // Err returns ErrNil or RedisErr or nil
 func (r *Reply) Err() error {
-	if r.t == typeError {
-		return r.err
-	}
-	if r.t == typeNil {
+	switch r.t {
+	case typeError:
+		return RedisErr(r.b)
+	case typeNil:
 		return ErrNil
 	}
 	return nil
+}
+
+// mismatch returns the error of a getter called on a reply of another type.
+func (r *Reply) mismatch() error {
+	if err := r.Err(); err != nil {
+		return err
+	}
+	return errTypeMismatch
+}
+
+// bytesSlice returns the elements of an array of strings, with nil for
+// "Null Bulk String" elements.
+func (r *Reply) bytesSlice() ([][]byte, error) {
+	aa, err := r.Array()
+	if err != nil || aa == nil {
+		return nil, err
+	}
+	ret := make([][]byte, len(aa))
+	for i := range aa {
+		if aa[i].t == typeNil {
+			continue
+		}
+		if ret[i], err = aa[i].Bytes(); err != nil {
+			return nil, err
+		}
+	}
+	return ret, nil
 }
 
 // Free resets Reply and put it back to memory pool.
@@ -121,8 +139,55 @@ func (r *Reply) Free() {
 	if r == nil {
 		return
 	}
-	r.Reset()
+	r.release()
 	if r.p {
 		replyPool.Put(r)
 	}
+}
+
+// release is Reset for a reply the package keeps for reuse, which also
+// drops the array of r if it is larger than maxArrayPrealloc, so the reply
+// does not pin the memory of one huge reply.
+func (r *Reply) release() {
+	r.reset(true)
+}
+
+// reset clears r, dropping its array as Reset or release describe, and
+// returns the number of elements its arrays keep, nested ones included.
+// The elements leave r.array[:len] here, where a later reset cannot see
+// them, so their arrays are trimmed now.
+func (r *Reply) reset(trim bool) int {
+	r.t = typeUnset
+	r.b = nil // never reuse it, it aliases the read buffer
+	r.i = 0
+	if len(r.array) < int(r.hide) && r.t != typeUnset {
+		// a reply that is not an array was read since the last reset,
+		// which reset twice in a row, as the helpers do, leaves alone
+		r.unhide(len(r.array))
+	}
+	nested := 0
+	for i := range r.array {
+		nested += r.array[i].reset(true)
+	}
+	if nested > maxNested || trim && cap(r.array) > maxArrayPrealloc {
+		r.array, r.hide = nil, 0
+		return 0
+	}
+	r.array = r.array[:0]
+	return cap(r.array) + nested
+}
+
+// unhide drops the nested arrays of the elements of r from n on, which the
+// reply read into r does not reuse, as reset no longer sees them: so a Reply
+// reused for many replies does not keep the arrays of each beyond maxNested.
+// The array of r has been reset, so they are within its capacity, which is
+// below hide if reading an array failed before it was filled.
+func (r *Reply) unhide(n int) {
+	if h := min(int(r.hide), cap(r.array)); h > n {
+		hidden := r.array[n:h]
+		for i := range hidden {
+			hidden[i].array = nil
+		}
+	}
+	r.hide = uint32(n)
 }

@@ -2,6 +2,8 @@ package redisgo
 
 import (
 	"io"
+	"strconv"
+	"strings"
 	"testing"
 )
 
@@ -124,6 +126,11 @@ func TestReplyMalformed(t *testing.T) {
 		"?\r\n",
 		"\r\n",
 		"$3\r\nabcde\r\n", // payload longer than declared
+		"$+1\r\nx\r\n",
+		"*+0\r\n",
+		"*-0\r\n",
+		"$-01\r\n",
+		"*-2\r\n",
 	}
 	for _, in := range cases {
 		c := newTestConn(in+"+OK\r\n", 0)
@@ -148,7 +155,7 @@ func TestReplyResetClearsRefs(t *testing.T) {
 		t.Fatal(err)
 	}
 	r.Reset()
-	if r.err != nil || r.b != nil || len(r.array) != 0 || r.t != typeUnset {
+	if r.b != nil || len(r.array) != 0 || r.t != typeUnset {
 		t.Fatalf("Reset left state behind: %+v", r)
 	}
 	if cap(r.array) == 0 || r.array[:1][0].b != nil {
@@ -178,5 +185,193 @@ func TestReplyReuseDoesNotAllocate(t *testing.T) {
 	})
 	if allocs != 0 {
 		t.Fatalf("expect 0 allocs when reusing a reply with nested arrays, got %v", allocs)
+	}
+}
+
+func TestParseInt(t *testing.T) {
+	ok := []string{"0", "-0", "+0", "7", "-1", "+1", "007", "123456789012345678", "-12345678901234567",
+		"+12345678901234567", "1234567890123456789", "9223372036854775807", "-9223372036854775808",
+		"+9223372036854775807"}
+	for _, s := range ok {
+		want, _ := strconv.ParseInt(s, 10, 64)
+		if n, err := parseInt([]byte(s)); err != nil || n != want {
+			t.Errorf("%q: expect %d, got %d %v", s, want, n, err)
+		}
+	}
+	bad := []string{"", "-", "+", "+-1", "-+1", "1-", "--1", "++1", " 1", "1 ", "0x1", "1.0",
+		"9223372036854775808", "-9223372036854775809", "+9223372036854775808"}
+	for _, s := range bad {
+		if n, err := parseInt([]byte(s)); err != errProtocol {
+			t.Errorf("%q: expect errProtocol, got %d %v", s, n, err)
+		}
+	}
+}
+
+// TestReleaseDropsNestedArrays checks that the scratch reply of a Conn does
+// not keep a large array nested in an earlier reply.
+func TestReleaseDropsNestedArrays(t *testing.T) {
+	inner := make([]string, 2*maxArrayPrealloc)
+	for i := range inner {
+		inner[i] = ":1\r\n"
+	}
+	c := newTestConn(tcmd(tcmd(inner...))+"+OK\r\n", 0)
+	if err := c.DoNoReply("EXEC"); err != nil {
+		t.Fatal(err)
+	}
+	if aa := c.reply.array[:cap(c.reply.array)]; len(aa) == 0 || cap(aa[0].array) > maxArrayPrealloc {
+		t.Fatalf("nested array of %d kept", cap(aa[0].array))
+	}
+	if err := c.DoNoReply("PING"); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestRecvClosedKeepsReply(t *testing.T) {
+	c := newTestConn("+OK\r\n", 0)
+	var r Reply
+	c.Send("PING")
+	if err := c.Recv(&r); err != nil {
+		t.Fatal(err)
+	}
+	c.Close()
+	if err := c.Recv(&r); err != errClosed || !r.IsOK() {
+		t.Fatal(err, r.IsOK())
+	}
+}
+
+// TestResetDropsHiddenNestedArrays checks that a large array nested in a
+// reply that is not the last one read into a Reply does not stay hidden
+// beyond the length of the array.
+func TestResetDropsHiddenNestedArrays(t *testing.T) {
+	inner := make([]string, 2*maxArrayPrealloc)
+	for i := range inner {
+		inner[i] = ":1\r\n"
+	}
+	big := tcmd(tcmd(inner...))
+	hidden := func(r *Reply) int {
+		aa := r.array[:cap(r.array)]
+		if len(aa) == 0 {
+			return 0
+		}
+		return cap(aa[0].array)
+	}
+	// the scratch Reply of the helpers
+	c := newTestConn(big+"+PONG\r\n", 0)
+	if err := c.DoNoReply("EXEC"); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := c.DoString("PING"); err != nil {
+		t.Fatal(err)
+	}
+	if n := hidden(&c.reply); n > maxArrayPrealloc {
+		t.Errorf("Do: nested array of %d kept", n)
+	}
+	// a Reply reused by Recv
+	c = newTestConn(big+"+PONG\r\n", 0)
+	r := NewReply()
+	defer r.Free()
+	c.Send("EXEC")
+	c.Send("PING")
+	c.Recv(r)
+	c.Recv(r)
+	if n := hidden(r); n > maxArrayPrealloc {
+		t.Errorf("Recv: nested array of %d kept", n)
+	}
+}
+
+// TestReleaseBoundsNestedTotal checks that many nested arrays, each within
+// maxArrayPrealloc, are not kept together.
+func TestReleaseBoundsNestedTotal(t *testing.T) {
+	child := make([]string, maxArrayPrealloc)
+	for i := range child {
+		child[i] = ":1\r\n"
+	}
+	children := make([]string, 64)
+	for i := range children {
+		children[i] = tcmd(child...)
+	}
+	c := newTestConn(tcmd(children...)+"+OK\r\n", 0)
+	if err := c.DoNoReply("EXEC"); err != nil {
+		t.Fatal(err)
+	}
+	kept := 0
+	for _, e := range c.reply.array[:cap(c.reply.array)] {
+		kept += cap(e.array)
+	}
+	if kept > maxNested {
+		t.Fatalf("%d nested elements kept", kept)
+	}
+	if err := c.DoNoReply("PING"); err != nil {
+		t.Fatal(err)
+	}
+}
+
+// retained counts the elements the arrays of r keep, hidden ones included.
+func retained(r *Reply) int {
+	n := cap(r.array)
+	for _, e := range r.array[:cap(r.array)] {
+		n += retained(&e)
+	}
+	return n
+}
+
+// TestResetBoundsAcrossReplies checks that the bound of nested arrays holds
+// for a Reply reused for many replies, each within it, where the elements
+// that are not reused by a shorter reply keep the arrays of a former one.
+func TestResetBoundsAcrossReplies(t *testing.T) {
+	child := make([]string, maxArrayPrealloc)
+	for i := range child {
+		child[i] = ":1\r\n"
+	}
+	heavy := tcmd(child...)
+	var replies strings.Builder
+	for k := 64; k > 0; k-- {
+		// k elements, the last 3 heavy: within the bound on its own
+		elems := make([]string, k)
+		for i := range elems {
+			elems[i] = ":1\r\n"
+			if i >= k-3 {
+				elems[i] = heavy
+			}
+		}
+		replies.WriteString(tcmd(elems...))
+		replies.WriteString(":1\r\n") // a scalar in between
+	}
+	c := newTestConn(replies.String(), 0)
+	r := NewReply()
+	defer r.Free()
+	most := 0
+	for range 128 {
+		c.Send("X")
+		if err := c.Recv(r); err != nil {
+			t.Fatal(err)
+		}
+		r.Reset()
+		most = max(most, retained(r))
+	}
+	if most > 2*maxNested {
+		t.Fatalf("%d elements kept by a reused Reply", most)
+	}
+}
+
+// TestResetAfterFailedArrayRead checks that a Reply is still safe to reset
+// and reuse after reading a large array failed half way.
+func TestResetAfterFailedArrayRead(t *testing.T) {
+	r := NewReply()
+	defer r.Free()
+	c := newTestConn("*5000\r\n:1\r\n:2\r\n", 0) // truncated
+	c.Send("X")
+	if err := c.Recv(r); err == nil {
+		t.Fatal("expect an error for a truncated array")
+	}
+	r.Reset()
+	c = newTestConn("*2\r\n*1\r\n:1\r\n:2\r\n+OK\r\n", 0)
+	c.Send("X")
+	c.Send("Y")
+	if err := c.Recv(r); err != nil {
+		t.Fatal(err)
+	}
+	if err := c.Recv(r); err != nil || !r.IsOK() {
+		t.Fatal(err)
 	}
 }
