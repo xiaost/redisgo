@@ -79,7 +79,7 @@ func TestReplyParse(t *testing.T) {
 			t.Fatalf("chunk=%d: expect nil bulk", chunk)
 		}
 		recv()
-		if aa, err := r.Array(); aa != nil || err != nil || r.IsNil() {
+		if aa, err := r.Array(); aa != nil || err != ErrNil || !r.IsNil() || r.Err() != ErrNil {
 			t.Fatalf("chunk=%d: expect nil array, got %v %v", chunk, aa, err)
 		}
 		recv()
@@ -207,6 +207,27 @@ func TestParseInt(t *testing.T) {
 	}
 }
 
+func TestReplyMaxDepth(t *testing.T) {
+	nested := func(depth int) string {
+		return strings.Repeat("*1\r\n", depth) + ":1\r\n"
+	}
+	c := newTestConn(nested(maxDepth)+"+OK\r\n", 0)
+	var r Reply
+	if err := c.Recv(&r); err != nil {
+		t.Fatal(err)
+	}
+	if err := c.Recv(&r); err != nil || !r.IsOK() {
+		t.Fatal(err)
+	}
+	// a stream nesting far beyond the stack limit must fail, not crash
+	for _, depth := range []int{maxDepth + 1, 1 << 24} {
+		c = newTestConn(nested(depth), 0)
+		if err := c.Recv(&r); err != errProtocol {
+			t.Fatalf("depth %d: expect errProtocol, got %v", depth, err)
+		}
+	}
+}
+
 // TestReleaseDropsNestedArrays checks that the scratch reply of a Conn does
 // not keep a large array nested in an earlier reply.
 func TestReleaseDropsNestedArrays(t *testing.T) {
@@ -255,11 +276,9 @@ func TestResetDropsHiddenNestedArrays(t *testing.T) {
 		}
 		return cap(aa[0].array)
 	}
-	// the scratch Reply of the helpers
+	// a pending reply dropped by Do
 	c := newTestConn(big+"+PONG\r\n", 0)
-	if err := c.DoNoReply("EXEC"); err != nil {
-		t.Fatal(err)
-	}
+	c.Send("EXEC")
 	if _, err := c.DoString("PING"); err != nil {
 		t.Fatal(err)
 	}

@@ -13,7 +13,6 @@ const (
 	typeInteger
 	typeSString
 	typeBString
-	typeNilArray
 	typeArray
 )
 
@@ -52,7 +51,9 @@ func (r *Reply) Reset() {
 	r.reset(false)
 }
 
-// IsNil returns true if redis response a "Null Bulk String"
+// IsNil returns true if redis replied a "Null Bulk String" or a "Null Array",
+// such as GET of a missing key, BLPOP on timeout or EXEC of an aborted
+// transaction. The getters return ErrNil for both.
 func (r *Reply) IsNil() bool {
 	return r.t == typeNil
 }
@@ -86,13 +87,10 @@ func (r *Reply) Integer() (int64, error) {
 // Array returns []Reply of array protocol:
 // https://redis.io/topics/protocol#resp-arrays
 func (r *Reply) Array() ([]Reply, error) {
-	switch r.t {
-	case typeArray:
-		return r.array, nil
-	case typeNilArray:
-		return nil, nil
+	if r.t != typeArray {
+		return nil, r.mismatch()
 	}
-	return nil, r.mismatch()
+	return r.array, nil
 }
 
 // Err returns ErrNil or RedisErr or nil
@@ -115,10 +113,10 @@ func (r *Reply) mismatch() error {
 }
 
 // bytesSlice returns the elements of an array of strings, with nil for
-// "Null Bulk String" elements.
+// nil elements.
 func (r *Reply) bytesSlice() ([][]byte, error) {
 	aa, err := r.Array()
-	if err != nil || aa == nil {
+	if err != nil {
 		return nil, err
 	}
 	ret := make([][]byte, len(aa))

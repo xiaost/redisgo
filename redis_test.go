@@ -423,11 +423,59 @@ func TestHelpersReuseReadBuffer(t *testing.T) {
 
 func TestDoBytesSliceNilArray(t *testing.T) {
 	c := newTestConn("*-1\r\n*0\r\n", 0)
-	if bb, err := c.DoBytesSlice("BLPOP", "k", 1); bb != nil || err != nil {
+	if bb, err := c.DoBytesSlice("BLPOP", "k", 1); bb != nil || err != ErrNil {
 		t.Fatal(bb, err)
 	}
 	if bb, err := c.DoBytesSlice("MGET", "k"); bb == nil || len(bb) != 0 || err != nil {
 		t.Fatal(bb, err)
+	}
+}
+
+func TestDoReadsPendingReplies(t *testing.T) {
+	c := newTestConn("+OK\r\n+QUEUED\r\n+QUEUED\r\n*2\r\n:1\r\n:2\r\n", 3)
+	c.Send("MULTI")
+	c.Send("INCR", "a")
+	c.Send("INCR", "b")
+	r, err := c.Do("EXEC")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if aa, err := r.Array(); err != nil || len(aa) != 2 || aa[1].i != 2 {
+		t.Fatalf("expect the reply of EXEC, got %v %v", aa, err)
+	}
+	r.Free()
+	if c.pd != 0 {
+		t.Fatal(c.pd)
+	}
+}
+
+func TestDoReturnsPendingError(t *testing.T) {
+	for _, chunk := range []int{0, 1, 3} {
+		testDoReturnsPendingError(t, chunk)
+	}
+}
+
+func testDoReturnsPendingError(t *testing.T, chunk int) {
+	c := newTestConn("+OK\r\n-ERR first\r\n-ERR second\r\n$1\r\nx\r\n$1\r\ny\r\n:7777777\r\n", chunk)
+	c.Send("SET", "a", 1)
+	c.Send("SET", "b", 2)
+	c.Send("SET", "c", 3)
+	_, err := c.DoString("GET", "x")
+	if _, ok := err.(RedisErr); !ok || err.Error() != "ERR first" {
+		t.Fatalf("expect the first pending error, got %v", err)
+	}
+	// the conn is still in sync, and err still intact after later reads
+	if s, err := c.DoString("GET", "y"); err != nil || s != "y" {
+		t.Fatal(s, err)
+	}
+	if n, err := c.DoInteger("INCR", "n"); err != nil || n != 7777777 {
+		t.Fatal(n, err)
+	}
+	if err.Error() != "ERR first" {
+		t.Fatalf("pending error corrupted: %q", err.Error())
+	}
+	if c.pd != 0 || c.Err() != nil {
+		t.Fatal(c.pd, c.Err())
 	}
 }
 

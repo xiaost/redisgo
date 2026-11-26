@@ -83,4 +83,9 @@ func main() {
   so the connection reuses the buffer for replies up to 64KB, and they allocate nothing but the returned string.
   Prefer them unless you need zero-copy bytes.
 - Call `Reply.Free` exactly once per `Reply` returned by `Do`.
+- A nil bulk string (`GET` of a missing key) and a nil array (`BLPOP` on timeout, an aborted `EXEC`)
+  are the same: `Reply.IsNil` reports both and the getters and helpers return `ErrNil`.
+- `Do` and the `DoXxx` helpers first receive and drop the replies still pending from `Send`,
+  like redigo, so `Send("MULTI")`, `Send(...)`, `Do("EXEC")` returns the reply of `EXEC`.
+  If a dropped reply is an error, the first one is returned instead.
 - Bulk strings and arrays longer than 512MB (the default `proto-max-bulk-len` of redis) are rejected as a protocol error.

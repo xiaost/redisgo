@@ -62,18 +62,45 @@ func (c *Conn) SetTimeout(t time.Duration) {
 	c.SetWriteTimeout(t)
 }
 
-// Do sends command to redis and recv reply.
-// Reply.Free() SHOULD be called when no longer used
+// Do sends a command to redis and receives its reply.
+// Reply.Free() SHOULD be called when no longer used.
+//
+// Replies still pending from earlier Sends are received and dropped first,
+// so Send("MULTI"), Send(...), Do("EXEC") returns the reply of EXEC. If any
+// dropped reply is a RedisErr, Do returns the first one instead of the reply.
+// The DoXxx helpers behave the same.
 func (c *Conn) Do(cmd string, args ...any) (*Reply, error) {
-	if err := c.Send(cmd, args...); err != nil {
-		return nil, err
-	}
 	reply := replyPool.Get().(*Reply)
-	if err := c.Recv(reply); err != nil {
+	if err := c.roundtrip(cmd, args, reply); err != nil {
 		reply.Free()
 		return nil, err
 	}
+	c.br.expose() // reply aliases the read buffer from now on
 	return reply, nil
+}
+
+// roundtrip sends a command and reads its reply into reply. Replies still
+// pending from earlier Sends are read into reply and dropped first, and the
+// first RedisErr among them is returned after the reply of the command has
+// been read, so the conn stays in sync.
+func (c *Conn) roundtrip(cmd string, args []any, reply *Reply) error {
+	if err := c.Send(cmd, args...); err != nil {
+		return err
+	}
+	var pending error
+	for c.pd > 1 {
+		if err := c.recv(reply); err != nil {
+			return err
+		}
+		if pending == nil && reply.t == typeError {
+			pending = RedisErr(reply.b)
+			c.br.expose() // pending aliases the read buffer
+		}
+	}
+	if err := c.recv(reply); err != nil {
+		return err
+	}
+	return pending
 }
 
 // Send buffers a command for redis. Nothing is written to the network until
@@ -138,7 +165,7 @@ func (c *Conn) recv(reply *Reply) error {
 	c.pd--
 	c.br.reclaim()
 	c.br.disarm() // the read timeout covers this reply only
-	if err := c.read(reply); err != nil {
+	if err := c.read(reply, 0); err != nil {
 		return c.seterr(err)
 	}
 	c.br.drop()
@@ -192,6 +219,11 @@ func (c *Conn) seterr(err error) error {
 // protects the client from absurd lengths sent by a broken peer.
 const maxLen = 512 << 20
 
+// maxDepth bounds the nesting of arrays. Replies of redis nest a few levels
+// at most, while endless nested headers from a broken peer would exhaust the
+// stack, which crashes the process instead of failing the conn.
+const maxDepth = 64
+
 // maxArrayPrealloc bounds the array capacity allocated up front from a
 // single header, so a bogus header cannot trigger a huge allocation.
 const maxArrayPrealloc = 1024
@@ -244,7 +276,8 @@ func parseLen(b []byte) (int, error) {
 	return int(n), nil
 }
 
-func (c *Conn) read(r *Reply) (err error) {
+// read reads a reply into r, which is nested in depth arrays.
+func (c *Conn) read(r *Reply, depth int) (err error) {
 	var b []byte
 	b, err = c.br.Readline()
 	if err != nil {
@@ -287,8 +320,11 @@ func (c *Conn) read(r *Reply) (err error) {
 			return
 		}
 		if n < 0 {
-			r.t = typeNilArray
+			r.t = typeNil // the same as a nil bulk string, RESP3 has a single null
 			return
+		}
+		if depth >= maxDepth {
+			return errProtocol
 		}
 		if r.array == nil || cap(r.array) < n {
 			r.array = make([]Reply, 0, min(n, maxArrayPrealloc))
@@ -304,7 +340,7 @@ func (c *Conn) read(r *Reply) (err error) {
 			} else {
 				r.array = append(r.array, Reply{})
 			}
-			if err = c.read(&r.array[i]); err != nil {
+			if err = c.read(&r.array[i], depth+1); err != nil {
 				return
 			}
 		}
@@ -318,13 +354,11 @@ func (c *Conn) read(r *Reply) (err error) {
 	return
 }
 
-// do sends a command and reads its reply into the scratch reply of c,
-// which saves the pool round trip of Do. The caller must call done.
+// do is Do with the scratch reply of c, which saves the sync.Pool round
+// trip. The caller must call done if do succeeds.
 func (c *Conn) do(cmd string, args []any) (*Reply, error) {
-	if err := c.Send(cmd, args...); err != nil {
-		return nil, err
-	}
-	if err := c.recv(&c.reply); err != nil {
+	if err := c.roundtrip(cmd, args, &c.reply); err != nil {
+		c.done(false, err)
 		return nil, err
 	}
 	return &c.reply, nil
@@ -378,7 +412,7 @@ func (c *Conn) DoString(cmd string, args ...any) (string, error) {
 }
 
 // DoBytesSlice wraps Do() and reply.Array() and reply.Bytes().
-// "Null Bulk String" elements are nil, and a "Null Array" returns nil.
+// Nil elements are nil, and a nil reply returns ErrNil like DoBytes.
 // The elements alias the read buffer, see Conn.
 func (c *Conn) DoBytesSlice(cmd string, args ...any) ([][]byte, error) {
 	r, err := c.do(cmd, args)
