@@ -255,7 +255,7 @@ func TestRecvClosedKeepsReply(t *testing.T) {
 		t.Fatal(err)
 	}
 	c.Close()
-	if err := c.Recv(&r); err != errClosed || !r.IsOK() {
+	if err := c.Recv(&r); err != ErrClosed || !r.IsOK() {
 		t.Fatal(err, r.IsOK())
 	}
 }

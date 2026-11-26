@@ -117,6 +117,19 @@ func BenchmarkPoolGetDoClose(b *testing.B) {
 	}
 }
 
+func BenchmarkPoolDoNoReply(b *testing.B) {
+	b.ReportAllocs()
+	p := NewPool(func(ctx context.Context) (*Conn, error) {
+		return benchConn("+OK\r\n"), nil
+	})
+	ctx := context.Background()
+	for b.Loop() {
+		if err := p.DoNoReply(ctx, "SET", "key", "value"); err != nil {
+			b.Fatal(err)
+		}
+	}
+}
+
 // serveOK runs a fake server on loopback that answers every command with
 // +OK, so benchmarks pay for real deadlines and syscalls.
 func serveOK(b *testing.B) net.Conn {

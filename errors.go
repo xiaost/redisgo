@@ -3,12 +3,15 @@ package redisgo
 import "errors"
 
 var (
-	ErrNil       = errors.New("redisgo: nil")
-	ErrMaxActive = errors.New("redisgo: max active connection exceeded")
+	ErrNil = errors.New("redisgo: nil")
+	// ErrPoolClosed is returned by Pool.Get after Pool.Close.
+	ErrPoolClosed = errors.New("redisgo: pool closed")
+	// ErrClosed is returned by a Conn after Close, and by a PoolConn after
+	// its Close.
+	ErrClosed = errors.New("redisgo: closed")
 
 	errProtocol       = errors.New("redisgo: protocol err")
 	errTypeMismatch   = errors.New("redisgo: type mismatch")
-	errClosed         = errors.New("redisgo: closed")
 	errInvalidArgType = errors.New("redisgo: invalid args type")
 )
 

@@ -146,7 +146,7 @@ type FakeConn struct {
 
 func (c *FakeConn) Read(b []byte) (int, error) {
 	if c.closed {
-		return 0, errClosed
+		return 0, ErrClosed
 	}
 	if len(c.reply) == 0 {
 		return 0, io.EOF
@@ -199,7 +199,7 @@ func TestFlushErrorIsFatal(t *testing.T) {
 	if err := c.Flush(); err != c.Err() {
 		t.Fatal(err)
 	}
-	if err := c.Close(); err != errClosed {
+	if err := c.Close(); err != ErrClosed {
 		t.Fatal(err)
 	}
 }
@@ -217,10 +217,10 @@ func TestCloseFlushes(t *testing.T) {
 	if sink.String() != "*1\r\n$4\r\nQUIT\r\n" {
 		t.Fatalf("Close did not flush: %q", sink.String())
 	}
-	if err := c.Close(); err != errClosed {
+	if err := c.Close(); err != ErrClosed {
 		t.Fatal(err)
 	}
-	if err := c.Send("PING"); err != errClosed {
+	if err := c.Send("PING"); err != ErrClosed {
 		t.Fatal(err)
 	}
 }

@@ -2,8 +2,11 @@ package redisgo
 
 import (
 	"bufio"
+	"errors"
 	"net"
+	"os"
 	"strconv"
+	"sync/atomic"
 	"time"
 )
 
@@ -27,8 +30,12 @@ type Conn struct {
 	err    error
 	closed bool
 	pd     int
+	lease  atomic.Uint64 // counts the PoolConn borrows put back, see PoolConn.Close
+
+	createdAt time.Time // set by the Pool that dialed the conn
 
 	wtimeout time.Duration
+	wdlset   bool // a write deadline is set on conn
 }
 
 // NewConn creates Conn
@@ -48,12 +55,16 @@ func NewConn(conn net.Conn, ops ...Option) *Conn {
 
 // SetReadTimeout sets the read timeout of underlying connection
 func (c *Conn) SetReadTimeout(t time.Duration) {
-	c.br.timeout = t
+	if c != nil {
+		c.br.timeout = t
+	}
 }
 
 // SetWriteTimeout sets the write timeout of underlying connection
 func (c *Conn) SetWriteTimeout(t time.Duration) {
-	c.wtimeout = t
+	if c != nil {
+		c.wtimeout = t
+	}
 }
 
 // SetTimeout sets the read and write timeouts of underlying connection
@@ -122,9 +133,9 @@ func (c *Conn) Send(cmd string, args ...any) error {
 		_, err = c.bw.Write(appendCommand(c.bw.AvailableBuffer(), cmd, n, args))
 		return c.seterr(err)
 	}
-	// bufio flushes while writing a command that does not fit.
-	if c.wtimeout > 0 {
-		c.conn.SetWriteDeadline(time.Now().Add(c.wtimeout))
+	// bufio flushes while writing a command that does not fit
+	if err := c.armWrite(); err != nil {
+		return c.seterr(err)
 	}
 	c.cmd = appendCommand(c.cmd[:0], cmd, n, args)
 	_, err = c.bw.Write(c.cmd)
@@ -142,17 +153,49 @@ func (c *Conn) Flush() error {
 	if c.bw.Buffered() == 0 {
 		return nil
 	}
-	if c.wtimeout > 0 {
-		c.conn.SetWriteDeadline(time.Now().Add(c.wtimeout))
+	if err := c.armWrite(); err != nil {
+		return c.seterr(err)
 	}
 	return c.seterr(c.bw.Flush())
 }
 
+// armWrite sets the write deadline before writing to the network, or lifts
+// the one of an earlier write if no deadline applies.
+func (c *Conn) armWrite() error {
+	if c.wtimeout > 0 || c.br.hasLimit || c.wdlset {
+		return c.setWriteDeadline()
+	}
+	return nil
+}
+
+func (c *Conn) setWriteDeadline() error {
+	t := c.br.deadline(c.wtimeout)
+	if err := c.conn.SetWriteDeadline(t); err != nil {
+		return err
+	}
+	c.wdlset = !t.IsZero()
+	return nil
+}
+
+// setLimit makes t, if not zero, bound every read and write of c on top of
+// the timeouts, until setLimit is called again.
+func (c *Conn) setLimit(t time.Time) {
+	c.br.limit = t
+	c.br.hasLimit = !t.IsZero()
+}
+
+// timedOutByLimit reports whether err is a timeout caused by the limit.
+func (c *Conn) timedOutByLimit(err error) bool {
+	return c.br.byLimit && errors.Is(err, os.ErrDeadlineExceeded)
+}
+
 // Recv receives reply from redis
 func (c *Conn) Recv(reply *Reply) error {
-	err := c.recv(reply)
+	if err := c.recv(reply); err != nil {
+		return err // the conn has failed, nothing is read any more
+	}
 	c.br.expose() // reply aliases the read buffer from now on
-	return err
+	return nil
 }
 
 // recv is Recv without exposing reply: the buffer space of reply is reused
@@ -172,22 +215,26 @@ func (c *Conn) recv(reply *Reply) error {
 	return nil
 }
 
-// Conn returns the underlying net.Conn
+// Conn returns the underlying net.Conn. The Conn sets read and write
+// deadlines on it as needed, so code using it directly should set its own.
 func (c *Conn) Conn() net.Conn {
+	if c == nil {
+		return nil
+	}
 	return c.conn
 }
 
 // Close flushes buffered commands and closes the underlying connection.
-// It returns errClosed if the connection was closed already, by Close or
+// It returns ErrClosed if the connection was closed already, by Close or
 // by an earlier fatal error.
 func (c *Conn) Close() error {
-	if c.closed {
-		return errClosed
+	if c == nil || c.closed {
+		return ErrClosed
 	}
 	if err := c.Flush(); err != nil {
 		return err // Flush closed the connection already
 	}
-	c.err = errClosed
+	c.err = ErrClosed
 	c.closed = true
 	return c.conn.Close()
 }
@@ -195,6 +242,9 @@ func (c *Conn) Close() error {
 // Err returns last fatal err.
 // if not nil, caller must not reuse the instance
 func (c *Conn) Err() error {
+	if c == nil {
+		return ErrClosed // see PoolConn.Close
+	}
 	return c.err
 }
 
@@ -357,6 +407,9 @@ func (c *Conn) read(r *Reply, depth int) (err error) {
 // do is Do with the scratch reply of c, which saves the sync.Pool round
 // trip. The caller must call done if do succeeds.
 func (c *Conn) do(cmd string, args []any) (*Reply, error) {
+	if c == nil {
+		return nil, ErrClosed // see PoolConn.Close
+	}
 	if err := c.roundtrip(cmd, args, &c.reply); err != nil {
 		c.done(false, err)
 		return nil, err

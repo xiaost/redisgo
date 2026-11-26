@@ -9,36 +9,50 @@ import (
 // PoolConn represents a conn borrowed from a Pool.
 // A new PoolConn is handed out by every Pool.Get, so a stale PoolConn
 // whose Close was already called cannot interfere with the next borrower.
+// A PoolConn must not be copied, as go vet reports: a copy keeps using
+// the conn after the original is closed.
 type PoolConn struct {
 	*Conn
 
-	p         *Pool
-	createdAt time.Time
-	closed    atomic.Bool
+	p      *Pool
+	lease  uint64 // Conn.lease when borrowed
+	closed atomic.Bool
 }
 
 // idleConn is a conn parked in the pool.
 type idleConn struct {
-	c         *Conn
-	createdAt time.Time
-	freedAt   time.Time
+	c       *Conn
+	freedAt time.Time
 }
 
-// CreatedAt returns the create time of the conn
+// CreatedAt returns the create time of the conn, or the zero time after
+// Close.
 func (c *PoolConn) CreatedAt() time.Time {
-	return c.createdAt
+	if c.Conn == nil {
+		return time.Time{}
+	}
+	return c.Conn.createdAt
 }
 
 // Close puts the conn back to the pool, or closes it if it has replies
 // pending or has failed. Calling Close more than once is a no-op.
+//
+// Close sets the embedded Conn to nil, whose methods return ErrClosed,
+// so a PoolConn used after Close fails instead of sending commands on a
+// conn that another goroutine may have borrowed since. Code that keeps
+// the embedded *Conn itself beyond Close has no such protection.
+//
+// Only the first Close of a borrow puts the conn back, even through a
+// copy of the PoolConn, so the conn is never handed out twice.
 func (c *PoolConn) Close() {
 	if !c.closed.CompareAndSwap(false, true) {
 		return
 	}
-	if c.Conn.pd != 0 {
-		c.Conn.Close()
+	conn := c.Conn
+	c.Conn = nil
+	if conn != nil && conn.lease.CompareAndSwap(c.lease, c.lease+1) {
+		c.p.put(conn)
 	}
-	c.p.put(c.Conn, c.createdAt)
 }
 
 // Pool represents a Conn pool
@@ -52,6 +66,9 @@ type Pool struct {
 	maxConnTime time.Duration
 
 	active int64
+	slots  chan struct{} // a token per conn owned, if maxActive > 0
+	closed atomic.Bool
+	done   chan struct{} // closed by Close to wake up waiting Gets
 
 	ch chan idleConn
 
@@ -70,9 +87,9 @@ func WithMaxIdle(n int) PoolOption {
 }
 
 // WithMaxActive limits the conns owned by the pool to n, idle conns
-// included. The counter is incremented when Get dials a new conn and
-// decremented when a conn is closed. Get returns ErrMaxActive instead of
-// dialing when the counter would exceed n.
+// included. When n conns are owned, Get waits until one is put back or
+// closed, the ctx passed to Get is done, or the pool is closed.
+// With n <= 0, the default, the number of conns is not limited.
 func WithMaxActive(n int) PoolOption {
 	return func(p *Pool) {
 		p.maxActive = int64(n)
@@ -103,7 +120,13 @@ func NewPool(dialfunc DialFunc, ops ...PoolOption) *Pool {
 	for _, op := range ops {
 		op(p)
 	}
-	p.ch = make(chan idleConn, p.maxIdle)
+	if p.maxIdle > 0 {
+		p.ch = make(chan idleConn, p.maxIdle) // else nil: never idle, no handoff
+	}
+	if p.maxActive > 0 {
+		p.slots = make(chan struct{}, p.maxActive)
+	}
+	p.done = make(chan struct{})
 	p.nowfunc = time.Now
 	return p
 }
@@ -118,60 +141,250 @@ func (p *Pool) Active() int {
 	return int(atomic.LoadInt64(&p.active))
 }
 
-// Get returns PoolConn from pool. ctx is passed to DialFunc.
+// Get returns PoolConn from pool. ctx is passed to DialFunc, and bounds
+// the wait for a conn if the pool is limited by WithMaxActive.
+//
+// The Pool.DoXxx helpers save the boilerplate, and the allocation of the
+// PoolConn, for single commands.
 func (p *Pool) Get(ctx context.Context) (*PoolConn, error) {
-	if err := ctx.Err(); err != nil {
+	ic, err := p.get(ctx)
+	if err != nil {
 		return nil, err
 	}
+	return &PoolConn{Conn: ic.c, p: p, lease: ic.c.lease.Load()}, nil
+}
+
+// Close closes the idle conns and makes waiting and later Get calls fail
+// with ErrPoolClosed. Conns in use are closed when they are put back.
+// It always returns nil.
+func (p *Pool) Close() error {
+	if p.closed.CompareAndSwap(false, true) {
+		close(p.done)
+	}
+	p.drain()
+	return nil
+}
+
+func (p *Pool) drain() {
 	for {
+		select {
+		case ic := <-p.ch:
+			p.closeconn(ic.c)
+		default:
+			return
+		}
+	}
+}
+
+func (p *Pool) get(ctx context.Context) (idleConn, error) {
+	if err := ctx.Err(); err != nil {
+		return idleConn{}, err
+	}
+	for {
+		if p.closed.Load() {
+			return idleConn{}, ErrPoolClosed
+		}
 		var ic idleConn
+		waited := false
 		select {
 		case ic = <-p.ch:
 		default:
-			return p.dialconn(ctx)
+			if p.slots == nil {
+				return p.dialconn(ctx)
+			}
+			// take a conn put back, or a slot to dial a new one
+			select {
+			case ic = <-p.ch:
+				waited = true
+			case p.slots <- struct{}{}:
+				return p.dialconn(ctx)
+			case <-ctx.Done():
+				return idleConn{}, ctx.Err()
+			case <-p.done:
+				return idleConn{}, ErrPoolClosed
+			}
 		}
-		now := p.nowfunc()
-		if (p.maxIdleTime > 0 && now.Sub(ic.freedAt) > p.maxIdleTime) ||
-			(p.maxConnTime > 0 && now.Sub(ic.createdAt) > p.maxConnTime) {
-			p.closeconn(ic.c)
+		if p.closed.Load() || p.expired(ic) {
+			p.closeconn(ic.c) // Close may have run since the check above
+			if err := ctx.Err(); err != nil {
+				return idleConn{}, err // ctx was done while closing it
+			}
 			continue
 		}
-		return &PoolConn{Conn: ic.c, p: p, createdAt: ic.createdAt}, nil
+		if waited && ctx.Err() != nil {
+			p.put(ic.c) // ctx was done while waiting
+			return idleConn{}, ctx.Err()
+		}
+		return ic, nil
 	}
 }
 
-func (p *Pool) dialconn(ctx context.Context) (*PoolConn, error) {
-	active := atomic.AddInt64(&p.active, 1)
-	if p.maxActive > 0 && active > p.maxActive {
-		atomic.AddInt64(&p.active, -1)
-		return nil, ErrMaxActive
+func (p *Pool) timed() bool {
+	return p.maxIdleTime > 0 || p.maxConnTime > 0
+}
+
+func (p *Pool) expired(ic idleConn) bool {
+	if !p.timed() {
+		return false // skip reading the clock
+	}
+	now := p.nowfunc()
+	return (p.maxIdleTime > 0 && now.Sub(ic.freedAt) > p.maxIdleTime) ||
+		(p.maxConnTime > 0 && now.Sub(ic.c.createdAt) > p.maxConnTime)
+}
+
+// dialconn dials a new conn. The caller holds a slot for it if the pool
+// is limited.
+func (p *Pool) dialconn(ctx context.Context) (idleConn, error) {
+	atomic.AddInt64(&p.active, 1)
+	if p.closed.Load() { // Close ran while waiting for the slot
+		p.release()
+		return idleConn{}, ErrPoolClosed
 	}
 	c, err := p.dial(ctx)
 	if err != nil {
-		atomic.AddInt64(&p.active, -1)
-		return nil, err
+		p.release()
+		return idleConn{}, err
 	}
-	return &PoolConn{Conn: c, p: p, createdAt: p.nowfunc()}, nil
+	if p.closed.Load() { // Close ran while dialing
+		p.closeconn(c)
+		return idleConn{}, ErrPoolClosed
+	}
+	c.createdAt = p.nowfunc()
+	if err := ctx.Err(); err != nil { // ctx was done while dialing
+		p.put(c)
+		return idleConn{}, err
+	}
+	return idleConn{c: c}, nil
 }
 
-func (p *Pool) put(c *Conn, createdAt time.Time) {
-	if c.Err() != nil {
+// release gives up the count and the slot of a conn.
+func (p *Pool) release() {
+	atomic.AddInt64(&p.active, -1)
+	if p.slots != nil {
+		<-p.slots
+	}
+}
+
+// put parks c in the pool, or closes it if it has replies pending, has
+// failed, has lived too long, or the pool is full or closed.
+func (p *Pool) put(c *Conn) {
+	if c.Err() != nil || c.pd != 0 || p.closed.Load() {
 		p.closeconn(c)
 		return
 	}
-	now := p.nowfunc()
-	if p.maxConnTime > 0 && now.Sub(createdAt) > p.maxConnTime {
-		p.closeconn(c)
-		return
+	var now time.Time
+	if p.timed() {
+		now = p.nowfunc()
+		if p.maxConnTime > 0 && now.Sub(c.createdAt) > p.maxConnTime {
+			p.closeconn(c)
+			return
+		}
 	}
 	select {
-	case p.ch <- idleConn{c: c, createdAt: createdAt, freedAt: now}:
+	case p.ch <- idleConn{c: c, freedAt: now}:
+		if p.closed.Load() {
+			p.drain() // Close may have drained the pool before the send
+		}
 	default:
 		p.closeconn(c)
 	}
 }
 
 func (p *Pool) closeconn(c *Conn) {
-	atomic.AddInt64(&p.active, -1)
 	c.Close()
+	p.release()
+}
+
+// begin gets a conn for a Pool.DoXxx call and bounds its I/O by the
+// deadline of ctx. It must be paired with end.
+func (p *Pool) begin(ctx context.Context) (idleConn, error) {
+	ic, err := p.get(ctx)
+	if err != nil {
+		return ic, err
+	}
+	if d, ok := ctx.Deadline(); ok {
+		ic.c.setLimit(d)
+	}
+	return ic, nil
+}
+
+// end lifts the deadline of ctx and puts the conn back. A timeout caused by
+// the deadline of ctx is reported as context.DeadlineExceeded, even if ctx
+// is not marked done yet when the conn times out at the same instant.
+func (p *Pool) end(ic idleConn, err error) error {
+	if ic.c.br.hasLimit {
+		if err != nil && ic.c.timedOutByLimit(err) {
+			err = context.DeadlineExceeded
+		}
+		ic.c.setLimit(time.Time{})
+	}
+	p.put(ic.c)
+	return err
+}
+
+// Do gets a conn, calls Conn.Do and puts the conn back.
+// The reply stays valid after the conn is reused by others;
+// Reply.Free should be called when it is no longer used.
+//
+// ctx bounds getting the conn as in Get, and its deadline, if earlier than
+// the timeouts of the conn, bounds the command. When the deadline passes
+// the conn is closed and the error of ctx is returned. Canceling a ctx
+// without a deadline does not interrupt a command already sent.
+// The other Pool.DoXxx helpers take ctx the same way.
+func (p *Pool) Do(ctx context.Context, cmd string, args ...any) (*Reply, error) {
+	ic, err := p.begin(ctx)
+	if err != nil {
+		return nil, err
+	}
+	r, err := ic.c.Do(cmd, args...)
+	return r, p.end(ic, err)
+}
+
+// DoNoReply is Do with Conn.DoNoReply.
+func (p *Pool) DoNoReply(ctx context.Context, cmd string, args ...any) error {
+	ic, err := p.begin(ctx)
+	if err != nil {
+		return err
+	}
+	return p.end(ic, ic.c.DoNoReply(cmd, args...))
+}
+
+// DoBytes is Do with Conn.DoBytes.
+func (p *Pool) DoBytes(ctx context.Context, cmd string, args ...any) ([]byte, error) {
+	ic, err := p.begin(ctx)
+	if err != nil {
+		return nil, err
+	}
+	b, err := ic.c.DoBytes(cmd, args...)
+	return b, p.end(ic, err)
+}
+
+// DoString is Do with Conn.DoString.
+func (p *Pool) DoString(ctx context.Context, cmd string, args ...any) (string, error) {
+	ic, err := p.begin(ctx)
+	if err != nil {
+		return "", err
+	}
+	s, err := ic.c.DoString(cmd, args...)
+	return s, p.end(ic, err)
+}
+
+// DoBytesSlice is Do with Conn.DoBytesSlice.
+func (p *Pool) DoBytesSlice(ctx context.Context, cmd string, args ...any) ([][]byte, error) {
+	ic, err := p.begin(ctx)
+	if err != nil {
+		return nil, err
+	}
+	bb, err := ic.c.DoBytesSlice(cmd, args...)
+	return bb, p.end(ic, err)
+}
+
+// DoInteger is Do with Conn.DoInteger.
+func (p *Pool) DoInteger(ctx context.Context, cmd string, args ...any) (int64, error) {
+	ic, err := p.begin(ctx)
+	if err != nil {
+		return 0, err
+	}
+	i, err := ic.c.DoInteger(cmd, args...)
+	return i, p.end(ic, err)
 }

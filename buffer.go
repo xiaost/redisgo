@@ -36,11 +36,16 @@ type reader struct {
 	sz  int
 	pin int // b[:pin] may be referenced by exposed replies, pin <= r
 
-	// A read deadline of now+timeout is set before the first read from rd
-	// after disarm, so replies already buffered cost no deadline update.
-	dl      readDeadliner
-	timeout time.Duration
-	armed   bool
+	// A read deadline of now+timeout, or limit if earlier, is set before
+	// the first read from rd after disarm, so replies already buffered cost
+	// no deadline update. The Conn arms its write deadline the same way.
+	dl       readDeadliner
+	timeout  time.Duration
+	limit    time.Time // see Conn.setLimit
+	hasLimit bool
+	armed    bool
+	dlset    bool // a read deadline is set on dl
+	byLimit  bool // the last deadline set, read or write, is limit
 }
 
 func newReader(r io.Reader, sz int) *reader {
@@ -117,13 +122,39 @@ func (r *reader) grow(sz int) {
 // read reads from rd into the free space of the buffer, setting the read
 // deadline first if needed.
 func (r *reader) read() (int, error) {
-	if !r.armed {
-		r.armed = true
-		if r.timeout > 0 && r.dl != nil {
-			r.dl.SetReadDeadline(time.Now().Add(r.timeout))
+	if !r.armed && (r.timeout > 0 || r.hasLimit || r.dlset) && r.dl != nil {
+		if err := r.arm(); err != nil {
+			return 0, err
 		}
 	}
 	return r.rd.Read(r.buf())
+}
+
+// arm sets the read deadline of the current reply, or lifts the one of an
+// earlier reply if no deadline applies.
+func (r *reader) arm() error {
+	r.armed = true
+	t := r.deadline(r.timeout)
+	if err := r.dl.SetReadDeadline(t); err != nil {
+		return err
+	}
+	r.dlset = !t.IsZero()
+	return nil
+}
+
+// deadline returns the deadline of an I/O starting now: now+timeout if
+// timeout is positive, or limit if set and earlier. The zero time means
+// no deadline. It records whether limit is the deadline in byLimit.
+func (r *reader) deadline(timeout time.Duration) time.Time {
+	var t time.Time
+	if timeout > 0 {
+		t = time.Now().Add(timeout)
+	}
+	r.byLimit = r.hasLimit && (t.IsZero() || r.limit.Before(t))
+	if r.byLimit {
+		t = r.limit
+	}
+	return t
 }
 
 // readmore reads at least n more bytes into the buffer.
