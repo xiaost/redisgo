@@ -73,7 +73,7 @@ type Pool struct {
 	maxIdleTime time.Duration
 	maxConnTime time.Duration
 
-	active int64
+	active atomic.Int64  // conns owned, idle ones included
 	slots  chan struct{} // a token per conn owned, if maxActive > 0
 	closed atomic.Bool
 	done   chan struct{} // closed by Close to wake up waiting Gets
@@ -146,7 +146,7 @@ func (p *Pool) Idle() int {
 
 // Active returns the number of conns owned by the pool, idle conns included
 func (p *Pool) Active() int {
-	return int(atomic.LoadInt64(&p.active))
+	return int(p.active.Load())
 }
 
 // Get returns PoolConn from pool. ctx is passed to DialFunc, and bounds
@@ -243,7 +243,7 @@ func (p *Pool) expired(ic idleConn) bool {
 // dialconn dials a new conn. The caller holds a slot for it if the pool
 // is limited.
 func (p *Pool) dialconn(ctx context.Context) (idleConn, error) {
-	atomic.AddInt64(&p.active, 1)
+	p.active.Add(1)
 	if p.closed.Load() { // Close ran while waiting for the slot
 		p.release()
 		return idleConn{}, ErrPoolClosed
@@ -276,7 +276,7 @@ func (p *Pool) dialconn(ctx context.Context) (idleConn, error) {
 
 // release gives up the count and the slot of a conn.
 func (p *Pool) release() {
-	atomic.AddInt64(&p.active, -1)
+	p.active.Add(-1)
 	if p.slots != nil {
 		<-p.slots
 	}
