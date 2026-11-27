@@ -1,0 +1,74 @@
+name: CI
+
+on:
+  push:
+    branches: ['**']
+  pull_request:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event_name }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  test:
+    # Branches of this repo are tested on push, pull requests from forks
+    # on pull_request, so a pull request is not tested twice.
+    if: github.event_name == 'push' || github.event.pull_request.head.repo.full_name != github.repository
+    name: test (go ${{ matrix.go }})
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        # the version in go.mod, and the latest one
+        go: ['1.25.x', stable]
+    services:
+      # for TestRedis, which is skipped without a server on 127.0.0.1:6379
+      redis:
+        image: redis:8-alpine
+        ports:
+          - 6379:6379
+        options: >-
+          --health-cmd "redis-cli ping"
+          --health-interval 2s
+          --health-timeout 3s
+          --health-retries 15
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: actions/setup-go@v7
+        with:
+          go-version: ${{ matrix.go }}
+          cache: false # no dependencies
+
+      - name: gofmt
+        run: |
+          unformatted=$(gofmt -l .)
+          if [ -n "$unformatted" ]; then
+            echo "not formatted with gofmt:"
+            echo "$unformatted"
+            exit 1
+          fi
+
+      - name: vet
+        run: |
+          go vet ./...
+          GOARCH=386 go vet ./...
+
+      - name: test
+        run: go test -race -count=1 -timeout 5m ./...
+
+      # fails if TestRedis was skipped, without the redis service
+      - name: test against redis
+        shell: bash
+        run: |
+          go test -run '^TestRedis$' -v -count=1 -timeout 1m . | grep -- '--- PASS: TestRedis'
+
+      # 32-bit platforms, where int and atomic alignment differ
+      - name: test on 386
+        run: GOARCH=386 go test -count=1 -timeout 5m ./...
+
+      - name: run benchmarks once
+        run: go test -run '^$' -bench . -benchtime=1x -timeout 5m ./...
