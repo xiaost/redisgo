@@ -3,6 +3,7 @@ package redisgo
 import (
 	"bufio"
 	"errors"
+	"iter"
 	"net"
 	"os"
 	"strconv"
@@ -25,8 +26,9 @@ type Conn struct {
 	conn  net.Conn
 	br    *reader
 	bw    *bufio.Writer
-	cmd   []byte // scratch for commands larger than bw
-	reply Reply  // scratch for the DoXxx helpers, see do
+	cmd   []byte   // scratch for commands larger than bw
+	reply Reply    // scratch for the DoXxx helpers, see do
+	pipe  Pipeline // scratch for Pool.Pipeline
 
 	err    error
 	closed bool
@@ -44,10 +46,10 @@ type Conn struct {
 
 // NewConn creates Conn
 func NewConn(conn net.Conn, ops ...Option) *Conn {
-	o := defaultoptions
-	for _, op := range ops {
-		o = op(o)
-	}
+	return newConn(conn, applyOptions(ops))
+}
+
+func newConn(conn net.Conn, o options) *Conn {
 	var r Conn
 	r.conn = conn
 	r.br = newReader(conn, o.rbuf)
@@ -120,10 +122,25 @@ func (c *Conn) roundtrip(cmd string, args []any, reply *Reply) error {
 
 // Send buffers a command for redis. Nothing is written to the network until
 // Flush or Recv is called or the write buffer fills up.
-// Send returns errInvalidArgType without touching the connection if an arg
+// Send returns ErrInvalidArgType without touching the connection if an arg
 // has an unsupported type.
 func (c *Conn) Send(cmd string, args ...any) error {
 	return c.send(cmd, args, false)
+}
+
+// Pending returns the number of commands sent whose replies have not yet
+// been received.
+func (c *Conn) Pending() int {
+	if c == nil {
+		return 0
+	}
+	return c.pd
+}
+
+// Pipeline returns a Pipeline bound to c for batching commands and reading
+// their replies without allocating a Reply per command.
+func (c *Conn) Pipeline() Pipeline {
+	return Pipeline{c: c}
 }
 
 // send is Send, for Do if do is true. Do relies on one reply per command,
@@ -309,7 +326,7 @@ func parseInt(b []byte) (int64, error) {
 	if len(b) > 18 {
 		n, err := strconv.ParseInt(ss(b), 10, 64)
 		if err != nil {
-			return 0, errProtocol
+			return 0, ErrProtocol
 		}
 		return n, nil
 	}
@@ -318,12 +335,12 @@ func parseInt(b []byte) (int64, error) {
 		d = d[1:]
 	}
 	if len(d) == 0 {
-		return 0, errProtocol
+		return 0, ErrProtocol
 	}
 	var n int64
 	for _, c := range d {
 		if c < '0' || c > '9' {
-			return 0, errProtocol
+			return 0, ErrProtocol
 		}
 		n = n*10 + int64(c-'0')
 	}
@@ -341,11 +358,11 @@ func parseLen(b []byte) (int, error) {
 		if string(b) == "-1" {
 			return -1, nil
 		}
-		return 0, errProtocol
+		return 0, ErrProtocol
 	}
 	n, err := parseInt(b)
 	if err != nil || n < -1 || n > maxLen {
-		return 0, errProtocol
+		return 0, ErrProtocol
 	}
 	return int(n), nil
 }
@@ -359,7 +376,7 @@ func (c *Conn) read(r *Reply, depth int) (err error) {
 	}
 	b = b[:len(b)-2] // remove CRLF
 	if len(b) == 0 {
-		return errProtocol
+		return ErrProtocol
 	}
 	t := b[0]
 	b = b[1:]
@@ -380,7 +397,7 @@ func (c *Conn) read(r *Reply, depth int) (err error) {
 			return
 		}
 		if r.b[n] != CR || r.b[n+1] != LF {
-			return errProtocol
+			return ErrProtocol
 		}
 		r.b = r.b[:n:n]
 		r.t = typeBString
@@ -398,7 +415,7 @@ func (c *Conn) read(r *Reply, depth int) (err error) {
 			return
 		}
 		if depth >= maxDepth {
-			return errProtocol
+			return ErrProtocol
 		}
 		if r.array == nil || cap(r.array) < n {
 			r.array = make([]Reply, 0, min(n, maxArrayPrealloc))
@@ -423,7 +440,7 @@ func (c *Conn) read(r *Reply, depth int) (err error) {
 		r.b = b
 		r.t = typeError
 	default:
-		err = errProtocol
+		err = ErrProtocol
 	}
 	return
 }
@@ -435,6 +452,19 @@ func (c *Conn) do(cmd string, args []any) (*Reply, error) {
 		return nil, ErrClosed // see PoolConn.Close
 	}
 	if err := c.roundtrip(cmd, args, &c.reply); err != nil {
+		c.done(false, err)
+		return nil, err
+	}
+	return &c.reply, nil
+}
+
+// recvScratch receives a reply into the scratch reply of c, mirroring do.
+// The caller must call done if recvScratch succeeds.
+func (c *Conn) recvScratch() (*Reply, error) {
+	if c == nil {
+		return nil, ErrClosed // see PoolConn.Close
+	}
+	if err := c.recv(&c.reply); err != nil {
 		c.done(false, err)
 		return nil, err
 	}
@@ -460,6 +490,18 @@ func (c *Conn) DoNoReply(cmd string, args ...any) error {
 	err = r.Err()
 	c.done(false, err)
 	return err
+}
+
+// DoOK sends cmd and reports whether Redis replied "+OK" (true) or nil (false).
+// Useful for conditional commands such as SET key val NX.
+func (c *Conn) DoOK(cmd string, args ...any) (bool, error) {
+	r, err := c.do(cmd, args)
+	if err != nil {
+		return false, err
+	}
+	ok, err := r.ok()
+	c.done(false, err)
+	return ok, err
 }
 
 // DoBytes wraps Do() and Reply.Bytes().
@@ -488,7 +530,7 @@ func (c *Conn) DoString(cmd string, args ...any) (string, error) {
 	return s, err
 }
 
-// DoBytesSlice wraps Do() and reply.Array() and reply.Bytes().
+// DoBytesSlice wraps Do() and Reply.BytesSlice().
 // Nil elements are nil, and a nil reply returns ErrNil like DoBytes.
 // The elements alias the read buffer, see Conn.
 func (c *Conn) DoBytesSlice(cmd string, args ...any) ([][]byte, error) {
@@ -496,7 +538,7 @@ func (c *Conn) DoBytesSlice(cmd string, args ...any) ([][]byte, error) {
 	if err != nil {
 		return nil, err
 	}
-	bb, err := r.bytesSlice()
+	bb, err := r.BytesSlice()
 	c.done(true, err)
 	return bb, err
 }
@@ -510,6 +552,357 @@ func (c *Conn) DoInteger(cmd string, args ...any) (int64, error) {
 	i, err := r.Integer()
 	c.done(false, err)
 	return i, err
+}
+
+// DoInt wraps Do() and Reply.Int().
+func (c *Conn) DoInt(cmd string, args ...any) (int, error) {
+	r, err := c.do(cmd, args)
+	if err != nil {
+		return 0, err
+	}
+	v, err := r.Int()
+	c.done(false, err)
+	return v, err
+}
+
+// DoInt64 wraps Do() and Reply.Int64().
+func (c *Conn) DoInt64(cmd string, args ...any) (int64, error) {
+	r, err := c.do(cmd, args)
+	if err != nil {
+		return 0, err
+	}
+	v, err := r.Int64()
+	c.done(false, err)
+	return v, err
+}
+
+// DoUint64 wraps Do() and Reply.Uint64().
+func (c *Conn) DoUint64(cmd string, args ...any) (uint64, error) {
+	r, err := c.do(cmd, args)
+	if err != nil {
+		return 0, err
+	}
+	v, err := r.Uint64()
+	c.done(false, err)
+	return v, err
+}
+
+// DoFloat64 wraps Do() and Reply.Float64().
+func (c *Conn) DoFloat64(cmd string, args ...any) (float64, error) {
+	r, err := c.do(cmd, args)
+	if err != nil {
+		return 0, err
+	}
+	v, err := r.Float64()
+	c.done(false, err)
+	return v, err
+}
+
+// DoBool wraps Do() and Reply.Bool().
+func (c *Conn) DoBool(cmd string, args ...any) (bool, error) {
+	r, err := c.do(cmd, args)
+	if err != nil {
+		return false, err
+	}
+	v, err := r.Bool()
+	c.done(false, err)
+	return v, err
+}
+
+// DoStrings wraps Do() and Reply.Strings().
+func (c *Conn) DoStrings(cmd string, args ...any) ([]string, error) {
+	r, err := c.do(cmd, args)
+	if err != nil {
+		return nil, err
+	}
+	v, err := r.Strings()
+	c.done(false, err)
+	return v, err
+}
+
+// DoInt64s wraps Do() and Reply.Int64s().
+func (c *Conn) DoInt64s(cmd string, args ...any) ([]int64, error) {
+	r, err := c.do(cmd, args)
+	if err != nil {
+		return nil, err
+	}
+	v, err := r.Int64s()
+	c.done(false, err)
+	return v, err
+}
+
+// DoFloat64s wraps Do() and Reply.Float64s().
+func (c *Conn) DoFloat64s(cmd string, args ...any) ([]float64, error) {
+	r, err := c.do(cmd, args)
+	if err != nil {
+		return nil, err
+	}
+	v, err := r.Float64s()
+	c.done(false, err)
+	return v, err
+}
+
+// DoBools wraps Do() and Reply.Bools().
+func (c *Conn) DoBools(cmd string, args ...any) ([]bool, error) {
+	r, err := c.do(cmd, args)
+	if err != nil {
+		return nil, err
+	}
+	v, err := r.Bools()
+	c.done(false, err)
+	return v, err
+}
+
+// DoStringMap wraps Do() and Reply.StringMap().
+func (c *Conn) DoStringMap(cmd string, args ...any) (map[string]string, error) {
+	r, err := c.do(cmd, args)
+	if err != nil {
+		return nil, err
+	}
+	v, err := r.StringMap()
+	c.done(false, err)
+	return v, err
+}
+
+// DoInt64Map wraps Do() and Reply.Int64Map().
+func (c *Conn) DoInt64Map(cmd string, args ...any) (map[string]int64, error) {
+	r, err := c.do(cmd, args)
+	if err != nil {
+		return nil, err
+	}
+	v, err := r.Int64Map()
+	c.done(false, err)
+	return v, err
+}
+
+// DoScan executes a SCAN/HSCAN/SSCAN/ZSCAN command and returns the next cursor
+// and the page of elements.
+func (c *Conn) DoScan(cmd string, args ...any) (uint64, []string, error) {
+	r, err := c.do(cmd, args)
+	if err != nil {
+		return 0, nil, err
+	}
+	cursor, items, err := r.scanResult()
+	c.done(false, err)
+	return cursor, items, err
+}
+
+// Scan iterates over keys returned by Redis SCAN, starting from cursor 0.
+// Extra arguments such as "MATCH", pattern, "COUNT", n, or "TYPE", t are
+// forwarded to each SCAN call.
+func (c *Conn) Scan(args ...any) iter.Seq2[string, error] {
+	return func(yield func(string, error) bool) {
+		callArgs := make([]any, 1+len(args))
+		copy(callArgs[1:], args)
+		var cursor uint64
+		for {
+			callArgs[0] = cursor
+			next, keys, err := c.DoScan("SCAN", callArgs...)
+			if err != nil {
+				yield("", err)
+				return
+			}
+			for _, k := range keys {
+				if !yield(k, nil) {
+					return
+				}
+			}
+			if next == 0 {
+				return
+			}
+			cursor = next
+		}
+	}
+}
+
+// RecvNoReply receives the next reply and returns Reply.Err().
+func (c *Conn) RecvNoReply() error {
+	r, err := c.recvScratch()
+	if err != nil {
+		return err
+	}
+	err = r.Err()
+	c.done(false, err)
+	return err
+}
+
+// RecvOK receives the next reply and reports whether Redis replied "+OK" (true)
+// or nil (false).
+func (c *Conn) RecvOK() (bool, error) {
+	r, err := c.recvScratch()
+	if err != nil {
+		return false, err
+	}
+	ok, err := r.ok()
+	c.done(false, err)
+	return ok, err
+}
+
+// RecvBytes receives the next reply and returns Reply.Bytes().
+// The returned slice aliases the read buffer of c, see Conn.
+func (c *Conn) RecvBytes() ([]byte, error) {
+	r, err := c.recvScratch()
+	if err != nil {
+		return nil, err
+	}
+	b, err := r.Bytes()
+	c.done(true, err)
+	return b, err
+}
+
+// RecvString receives the next reply and copies it into a string.
+func (c *Conn) RecvString() (string, error) {
+	r, err := c.recvScratch()
+	if err != nil {
+		return "", err
+	}
+	s, err := r.String()
+	c.done(false, err)
+	return s, err
+}
+
+// RecvInteger receives the next reply and returns Reply.Integer().
+func (c *Conn) RecvInteger() (int64, error) {
+	r, err := c.recvScratch()
+	if err != nil {
+		return 0, err
+	}
+	v, err := r.Integer()
+	c.done(false, err)
+	return v, err
+}
+
+// RecvInt receives the next reply and returns Reply.Int().
+func (c *Conn) RecvInt() (int, error) {
+	r, err := c.recvScratch()
+	if err != nil {
+		return 0, err
+	}
+	v, err := r.Int()
+	c.done(false, err)
+	return v, err
+}
+
+// RecvInt64 receives the next reply and returns Reply.Int64().
+func (c *Conn) RecvInt64() (int64, error) {
+	r, err := c.recvScratch()
+	if err != nil {
+		return 0, err
+	}
+	v, err := r.Int64()
+	c.done(false, err)
+	return v, err
+}
+
+// RecvUint64 receives the next reply and returns Reply.Uint64().
+func (c *Conn) RecvUint64() (uint64, error) {
+	r, err := c.recvScratch()
+	if err != nil {
+		return 0, err
+	}
+	v, err := r.Uint64()
+	c.done(false, err)
+	return v, err
+}
+
+// RecvFloat64 receives the next reply and returns Reply.Float64().
+func (c *Conn) RecvFloat64() (float64, error) {
+	r, err := c.recvScratch()
+	if err != nil {
+		return 0, err
+	}
+	v, err := r.Float64()
+	c.done(false, err)
+	return v, err
+}
+
+// RecvBool receives the next reply and returns Reply.Bool().
+func (c *Conn) RecvBool() (bool, error) {
+	r, err := c.recvScratch()
+	if err != nil {
+		return false, err
+	}
+	v, err := r.Bool()
+	c.done(false, err)
+	return v, err
+}
+
+// RecvBytesSlice receives the next reply and returns Reply.BytesSlice().
+// The returned slices alias the read buffer of c, see Conn.
+func (c *Conn) RecvBytesSlice() ([][]byte, error) {
+	r, err := c.recvScratch()
+	if err != nil {
+		return nil, err
+	}
+	bb, err := r.BytesSlice()
+	c.done(true, err)
+	return bb, err
+}
+
+// RecvStrings receives the next reply and returns Reply.Strings().
+func (c *Conn) RecvStrings() ([]string, error) {
+	r, err := c.recvScratch()
+	if err != nil {
+		return nil, err
+	}
+	v, err := r.Strings()
+	c.done(false, err)
+	return v, err
+}
+
+// RecvInt64s receives the next reply and returns Reply.Int64s().
+func (c *Conn) RecvInt64s() ([]int64, error) {
+	r, err := c.recvScratch()
+	if err != nil {
+		return nil, err
+	}
+	v, err := r.Int64s()
+	c.done(false, err)
+	return v, err
+}
+
+// RecvFloat64s receives the next reply and returns Reply.Float64s().
+func (c *Conn) RecvFloat64s() ([]float64, error) {
+	r, err := c.recvScratch()
+	if err != nil {
+		return nil, err
+	}
+	v, err := r.Float64s()
+	c.done(false, err)
+	return v, err
+}
+
+// RecvBools receives the next reply and returns Reply.Bools().
+func (c *Conn) RecvBools() ([]bool, error) {
+	r, err := c.recvScratch()
+	if err != nil {
+		return nil, err
+	}
+	v, err := r.Bools()
+	c.done(false, err)
+	return v, err
+}
+
+// RecvStringMap receives the next reply and returns Reply.StringMap().
+func (c *Conn) RecvStringMap() (map[string]string, error) {
+	r, err := c.recvScratch()
+	if err != nil {
+		return nil, err
+	}
+	v, err := r.StringMap()
+	c.done(false, err)
+	return v, err
+}
+
+// RecvInt64Map receives the next reply and returns Reply.Int64Map().
+func (c *Conn) RecvInt64Map() (map[string]int64, error) {
+	r, err := c.recvScratch()
+	if err != nil {
+		return nil, err
+	}
+	v, err := r.Int64Map()
+	c.done(false, err)
+	return v, err
 }
 
 // Session states set by commands. A Pool closes a conn in any of them
@@ -621,31 +1014,85 @@ func (c *Conn) client(args []any) error {
 
 // nthArg returns the i-th bulk string args expand to, if it is a string.
 func nthArg(args []any, i int) (string, bool) {
+	s, _, ok := nthArgAt(args, i, 0)
+	return s, ok
+}
+
+func nthArgAt(args []any, i, depth int) (string, int, bool) {
 	for _, a := range args {
 		switch v := a.(type) {
 		case string:
 			if i == 0 {
-				return v, true
+				return v, 0, true
 			}
 			i--
 		case []byte:
 			if i == 0 {
-				return ss(v), true
+				return ss(v), 0, true
 			}
 			i--
 		case []string:
 			if i < len(v) {
-				return v[i], true
+				return v[i], 0, true
 			}
 			i -= len(v)
+		case [][]byte:
+			if i < len(v) {
+				return ss(v[i]), 0, true
+			}
+			i -= len(v)
+		case []int:
+			if i < len(v) {
+				return "", -1, false
+			}
+			i -= len(v)
+		case []int64:
+			if i < len(v) {
+				return "", -1, false
+			}
+			i -= len(v)
+		case []uint64:
+			if i < len(v) {
+				return "", -1, false
+			}
+			i -= len(v)
+		case []float64:
+			if i < len(v) {
+				return "", -1, false
+			}
+			i -= len(v)
+		case []any:
+			if depth >= maxArgDepth {
+				return "", -1, false
+			}
+			val, rem, ok := nthArgAt(v, i, depth+1)
+			if ok || rem < 0 {
+				return val, rem, ok
+			}
+			i = rem
+		case map[string]string:
+			if i < 2*len(v) {
+				return "", -1, false
+			}
+			i -= 2 * len(v)
+		case map[string][]byte:
+			if i < 2*len(v) {
+				return "", -1, false
+			}
+			i -= 2 * len(v)
+		case map[string]any:
+			if i < 2*len(v) {
+				return "", -1, false
+			}
+			i -= 2 * len(v)
 		default:
 			if i == 0 {
-				return "", false
+				return "", -1, false
 			}
 			i--
 		}
 	}
-	return "", false
+	return "", i, false
 }
 
 // endMulti handles EXEC or DISCARD with n args, which end a transaction

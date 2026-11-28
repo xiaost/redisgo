@@ -130,6 +130,137 @@ func BenchmarkPoolDoNoReply(b *testing.B) {
 	}
 }
 
+func BenchmarkDoOK(b *testing.B) {
+	b.ReportAllocs()
+	c := benchConn("+OK\r\n")
+	for b.Loop() {
+		if _, err := c.DoOK("SET", "key", "value", "NX"); err != nil {
+			b.Fatal(err)
+		}
+	}
+}
+
+func BenchmarkDoInt64(b *testing.B) {
+	b.ReportAllocs()
+	c := benchConn("$5\r\n12345\r\n")
+	for b.Loop() {
+		if _, err := c.DoInt64("GET", "counter"); err != nil {
+			b.Fatal(err)
+		}
+	}
+}
+
+func BenchmarkDoFloat64(b *testing.B) {
+	b.ReportAllocs()
+	c := benchConn("$6\r\n123.45\r\n")
+	for b.Loop() {
+		if _, err := c.DoFloat64("ZSCORE", "z", "m"); err != nil {
+			b.Fatal(err)
+		}
+	}
+}
+
+func BenchmarkDoBool(b *testing.B) {
+	b.ReportAllocs()
+	c := benchConn(":1\r\n")
+	for b.Loop() {
+		if _, err := c.DoBool("EXISTS", "key"); err != nil {
+			b.Fatal(err)
+		}
+	}
+}
+
+func BenchmarkDoStrings(b *testing.B) {
+	b.ReportAllocs()
+	c := benchConn(mgetReply(10))
+	for b.Loop() {
+		if _, err := c.DoStrings("MGET", "k0", "k1", "k2", "k3", "k4", "k5", "k6", "k7", "k8", "k9"); err != nil {
+			b.Fatal(err)
+		}
+	}
+}
+
+func BenchmarkDoStringMap(b *testing.B) {
+	b.ReportAllocs()
+	c := benchConn(mgetReply(20))
+	for b.Loop() {
+		if _, err := c.DoStringMap("HGETALL", "hash"); err != nil {
+			b.Fatal(err)
+		}
+	}
+}
+
+func BenchmarkRecvInt64(b *testing.B) {
+	b.ReportAllocs()
+	c := benchConn("$5\r\n12345\r\n")
+	for b.Loop() {
+		if err := c.Send("GET", "counter"); err != nil {
+			b.Fatal(err)
+		}
+		if _, err := c.RecvInt64(); err != nil {
+			b.Fatal(err)
+		}
+	}
+}
+
+func BenchmarkPoolWithConn(b *testing.B) {
+	b.ReportAllocs()
+	p := NewPool(func(ctx context.Context) (*Conn, error) {
+		return benchConn("+OK\r\n"), nil
+	})
+	ctx := context.Background()
+	for b.Loop() {
+		err := p.WithConn(ctx, func(c *Conn) error {
+			return c.DoNoReply("SET", "key", "value")
+		})
+		if err != nil {
+			b.Fatal(err)
+		}
+	}
+}
+
+func BenchmarkPoolPipeline(b *testing.B) {
+	b.ReportAllocs()
+	p := NewPool(func(ctx context.Context) (*Conn, error) {
+		return benchConn("+OK\r\n:1\r\n$3\r\n100\r\n"), nil
+	})
+	ctx := context.Background()
+	for b.Loop() {
+		err := p.Pipeline(ctx, func(pipe *Pipeline) error {
+			pipe.Send("SET", "k", "v")
+			pipe.Send("INCR", "n")
+			pipe.Send("GET", "n")
+			if err := pipe.RecvNoReply(); err != nil {
+				return err
+			}
+			if _, err := pipe.RecvInt64(); err != nil {
+				return err
+			}
+			if _, err := pipe.RecvInt64(); err != nil {
+				return err
+			}
+			return nil
+		})
+		if err != nil {
+			b.Fatal(err)
+		}
+	}
+}
+
+func BenchmarkScriptDoInt64(b *testing.B) {
+	b.ReportAllocs()
+	p := NewPool(func(ctx context.Context) (*Conn, error) {
+		return benchConn(":42\r\n"), nil
+	})
+	sc := NewScript(1, "return redis.call('INCR', KEYS[1])")
+	ctx := context.Background()
+	for b.Loop() {
+		if _, err := sc.DoInt64(ctx, p, "counter"); err != nil {
+			b.Fatal(err)
+		}
+	}
+}
+
 // serveOK runs a fake server on loopback that answers every command with
 // +OK, so benchmarks pay for real deadlines and syscalls.
 func serveOK(b *testing.B) net.Conn {

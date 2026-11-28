@@ -692,6 +692,8 @@ func TestPoolTracksSubcommands(t *testing.T) {
 		{[]any{"SCRIPT", "LOAD", "return 1"}, true},
 		{[]any{"CLIENT", "SETNAME", "x"}, false},
 		{[]any{"CLIENT", []string{"TRACKING", "ON"}}, false},
+		{[]any{"CLIENT", []any{"SETNAME", "y"}}, false},
+		{[]any{"CLIENT", []any{123, "ID"}}, false},
 		{[]any{"SCRIPT", "debug", "yes"}, false},
 		{[]any{"ASKING"}, false},
 	} {
@@ -706,7 +708,7 @@ func TestPoolTracksSubcommands(t *testing.T) {
 		t.Fatal(err)
 	}
 	n := dials.Load()
-	for _, args := range [][]any{{"REPLY", "OFF"}, {"reply", "skip"}, {[]string{"REPLY", "OFF"}}, {"REPLY"}} {
+	for _, args := range [][]any{{"REPLY", "OFF"}, {"reply", "skip"}, {[]string{"REPLY", "OFF"}}, {[]any{"REPLY"}, "OFF"}, {"REPLY"}} {
 		if err := p.DoNoReply(ctx, "CLIENT", args...); err != errClientReply {
 			t.Errorf("CLIENT %v: expect errClientReply, got %v", args, err)
 		}
@@ -999,5 +1001,188 @@ func TestPoolZeroMaxIdleWaiter(t *testing.T) {
 	c0.Close()
 	if err := <-res; err != nil || dials.Load() != 2 {
 		t.Fatal(err, dials.Load())
+	}
+}
+
+func TestPoolWithConn(t *testing.T) {
+	p := NewPool(func(ctx context.Context) (*Conn, error) {
+		return NewConn(&FakeConn{reply: []byte("+OK\r\n")}, WithReadTimeout(0), WithWriteTimeout(0)), nil
+	}, WithMaxIdle(2), WithMaxActive(1))
+	defer p.Close()
+	ctx := context.Background()
+
+	allocs := testing.AllocsPerRun(200, func() {
+		err := p.WithConn(ctx, func(c *Conn) error {
+			return c.DoNoReply("SET", "k", "v")
+		})
+		if err != nil {
+			t.Fatal(err)
+		}
+	})
+	if allocs != 0 {
+		t.Fatalf("expect 0 allocs in Pool.WithConn, got %v", allocs)
+	}
+
+	// Panic inside WithConn must close conn and release slot.
+	func() {
+		defer func() { _ = recover() }()
+		_ = p.WithConn(ctx, func(c *Conn) error {
+			panic("boom")
+		})
+	}()
+	if p.Active() != 0 || p.Idle() != 0 {
+		t.Fatalf("panic leaked active/idle conn: active=%d idle=%d", p.Active(), p.Idle())
+	}
+
+	// Unread Send inside WithConn must discard conn instead of pooling.
+	if err := p.WithConn(ctx, func(c *Conn) error {
+		return c.Send("PING")
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if p.Idle() != 0 || p.Active() != 0 {
+		t.Fatalf("dirty conn kept in pool: active=%d idle=%d", p.Active(), p.Idle())
+	}
+}
+
+func TestPoolWithConnTimeout(t *testing.T) {
+	p := NewPool(func(ctx context.Context) (*Conn, error) {
+		client, server := net.Pipe()
+		go io.Copy(io.Discard, server)
+		return NewConn(client), nil
+	})
+	defer p.Close()
+	ctx, cancel := context.WithTimeout(context.Background(), 25*time.Millisecond)
+	defer cancel()
+	err := p.WithConn(ctx, func(c *Conn) error {
+		return c.DoNoReply("BLPOP", "k", 0)
+	})
+	if err != context.DeadlineExceeded {
+		t.Fatal(err)
+	}
+	if p.Active() != 0 {
+		t.Fatal(p.Active())
+	}
+}
+
+func TestPoolNewDoHelpersAndClosedPoolConn(t *testing.T) {
+	p := NewPool(func(ctx context.Context) (*Conn, error) {
+		resp := "+OK\r\n" +
+			":11\r\n" +
+			tstr("22") +
+			tstr("33") +
+			tstr("4.5") +
+			":1\r\n" +
+			tcmd(tstr("x"), tstr("y")) +
+			tcmd(":7\r\n") +
+			tcmd(tstr("2.5")) +
+			tcmd(":0\r\n") +
+			tcmd(tstr("a"), tstr("b")) +
+			tcmd(tstr("k"), ":5\r\n")
+		return newTestConn(resp, 0), nil
+	}, WithMaxIdle(1))
+	defer p.Close()
+	ctx := context.Background()
+
+	if ok, err := p.DoOK(ctx, "SET", "k", "v"); err != nil || !ok {
+		t.Fatal(ok, err)
+	}
+	if v, err := p.DoInt(ctx, "INCR", "k"); err != nil || v != 11 {
+		t.Fatal(v, err)
+	}
+	if v, err := p.DoInt64(ctx, "GET", "k"); err != nil || v != 22 {
+		t.Fatal(v, err)
+	}
+	if v, err := p.DoUint64(ctx, "GET", "k"); err != nil || v != 33 {
+		t.Fatal(v, err)
+	}
+	if v, err := p.DoFloat64(ctx, "ZSCORE", "z", "m"); err != nil || v != 4.5 {
+		t.Fatal(v, err)
+	}
+	if v, err := p.DoBool(ctx, "EXISTS", "k"); err != nil || !v {
+		t.Fatal(v, err)
+	}
+	if v, err := p.DoStrings(ctx, "LRANGE", "l", 0, -1); err != nil || len(v) != 2 || v[1] != "y" {
+		t.Fatal(v, err)
+	}
+	if v, err := p.DoInt64s(ctx, "SMISMEMBER", "s", "k"); err != nil || len(v) != 1 || v[0] != 7 {
+		t.Fatal(v, err)
+	}
+	if v, err := p.DoFloat64s(ctx, "X"); err != nil || len(v) != 1 || v[0] != 2.5 {
+		t.Fatal(v, err)
+	}
+	if v, err := p.DoBools(ctx, "X"); err != nil || len(v) != 1 || v[0] {
+		t.Fatal(v, err)
+	}
+	if v, err := p.DoStringMap(ctx, "HGETALL", "h"); err != nil || v["a"] != "b" {
+		t.Fatal(v, err)
+	}
+	if v, err := p.DoInt64Map(ctx, "HGETALL", "h"); err != nil || v["k"] != 5 {
+		t.Fatal(v, err)
+	}
+
+	pc, err := p.Get(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	pc.Close()
+	if pc.Pending() != 0 {
+		t.Fatal(pc.Pending())
+	}
+	if _, err := pc.DoOK("SET", "k", "v"); err != ErrClosed {
+		t.Fatal(err)
+	}
+	if _, err := pc.DoInt64("GET", "k"); err != ErrClosed {
+		t.Fatal(err)
+	}
+	if err := pc.RecvNoReply(); err != ErrClosed {
+		t.Fatal(err)
+	}
+	if _, err := pc.RecvString(); err != ErrClosed {
+		t.Fatal(err)
+	}
+	pipe := pc.Pipeline()
+	pipe.Send("PING")
+	if pipe.Err() != ErrClosed {
+		t.Fatal(pipe.Err())
+	}
+	var scanErr error
+	for _, err := range pc.Scan() {
+		scanErr = err
+	}
+	if scanErr != ErrClosed {
+		t.Fatalf("expect ErrClosed from closed PoolConn.Scan, got %v", scanErr)
+	}
+}
+
+// TestPoolScanNoDeadlock checks that Pool.Scan releases the borrowed connection
+// between pages so callers can invoke Pool.DoXxx inside the loop even when
+// MaxActive is 1.
+func TestPoolScanNoDeadlock(t *testing.T) {
+	p := NewPool(func(ctx context.Context) (*Conn, error) {
+		return newTestConn(
+			tcmd(tstr("3"), tcmd(tstr("k1")))+
+				tstr("v1")+
+				tcmd(tstr("0"), tcmd(tstr("k2")))+
+				tstr("v2"),
+			0,
+		), nil
+	}, WithMaxIdle(1), WithMaxActive(1))
+	defer p.Close()
+	ctx := context.Background()
+
+	vals := make(map[string]string)
+	for k, err := range p.Scan(ctx) {
+		if err != nil {
+			t.Fatal(err)
+		}
+		v, err := p.DoString(ctx, "GET", k)
+		if err != nil {
+			t.Fatal(err)
+		}
+		vals[k] = v
+	}
+	if vals["k1"] != "v1" || vals["k2"] != "v2" || len(vals) != 2 {
+		t.Fatalf("unexpected vals: %v", vals)
 	}
 }

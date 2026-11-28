@@ -2,6 +2,7 @@ package redisgo
 
 import (
 	"context"
+	"iter"
 	"sync/atomic"
 	"time"
 )
@@ -405,4 +406,208 @@ func (p *Pool) DoInteger(ctx context.Context, cmd string, args ...any) (int64, e
 	}
 	i, err := ic.c.DoInteger(cmd, args...)
 	return i, p.end(ic, err)
+}
+
+// DoOK is Do with Conn.DoOK.
+func (p *Pool) DoOK(ctx context.Context, cmd string, args ...any) (bool, error) {
+	ic, err := p.begin(ctx)
+	if err != nil {
+		return false, err
+	}
+	ok, err := ic.c.DoOK(cmd, args...)
+	return ok, p.end(ic, err)
+}
+
+// DoInt is Do with Conn.DoInt.
+func (p *Pool) DoInt(ctx context.Context, cmd string, args ...any) (int, error) {
+	ic, err := p.begin(ctx)
+	if err != nil {
+		return 0, err
+	}
+	v, err := ic.c.DoInt(cmd, args...)
+	return v, p.end(ic, err)
+}
+
+// DoInt64 is Do with Conn.DoInt64.
+func (p *Pool) DoInt64(ctx context.Context, cmd string, args ...any) (int64, error) {
+	ic, err := p.begin(ctx)
+	if err != nil {
+		return 0, err
+	}
+	v, err := ic.c.DoInt64(cmd, args...)
+	return v, p.end(ic, err)
+}
+
+// DoUint64 is Do with Conn.DoUint64.
+func (p *Pool) DoUint64(ctx context.Context, cmd string, args ...any) (uint64, error) {
+	ic, err := p.begin(ctx)
+	if err != nil {
+		return 0, err
+	}
+	v, err := ic.c.DoUint64(cmd, args...)
+	return v, p.end(ic, err)
+}
+
+// DoFloat64 is Do with Conn.DoFloat64.
+func (p *Pool) DoFloat64(ctx context.Context, cmd string, args ...any) (float64, error) {
+	ic, err := p.begin(ctx)
+	if err != nil {
+		return 0, err
+	}
+	v, err := ic.c.DoFloat64(cmd, args...)
+	return v, p.end(ic, err)
+}
+
+// DoBool is Do with Conn.DoBool.
+func (p *Pool) DoBool(ctx context.Context, cmd string, args ...any) (bool, error) {
+	ic, err := p.begin(ctx)
+	if err != nil {
+		return false, err
+	}
+	v, err := ic.c.DoBool(cmd, args...)
+	return v, p.end(ic, err)
+}
+
+// DoStrings is Do with Conn.DoStrings.
+func (p *Pool) DoStrings(ctx context.Context, cmd string, args ...any) ([]string, error) {
+	ic, err := p.begin(ctx)
+	if err != nil {
+		return nil, err
+	}
+	v, err := ic.c.DoStrings(cmd, args...)
+	return v, p.end(ic, err)
+}
+
+// DoInt64s is Do with Conn.DoInt64s.
+func (p *Pool) DoInt64s(ctx context.Context, cmd string, args ...any) ([]int64, error) {
+	ic, err := p.begin(ctx)
+	if err != nil {
+		return nil, err
+	}
+	v, err := ic.c.DoInt64s(cmd, args...)
+	return v, p.end(ic, err)
+}
+
+// DoFloat64s is Do with Conn.DoFloat64s.
+func (p *Pool) DoFloat64s(ctx context.Context, cmd string, args ...any) ([]float64, error) {
+	ic, err := p.begin(ctx)
+	if err != nil {
+		return nil, err
+	}
+	v, err := ic.c.DoFloat64s(cmd, args...)
+	return v, p.end(ic, err)
+}
+
+// DoBools is Do with Conn.DoBools.
+func (p *Pool) DoBools(ctx context.Context, cmd string, args ...any) ([]bool, error) {
+	ic, err := p.begin(ctx)
+	if err != nil {
+		return nil, err
+	}
+	v, err := ic.c.DoBools(cmd, args...)
+	return v, p.end(ic, err)
+}
+
+// DoStringMap is Do with Conn.DoStringMap.
+func (p *Pool) DoStringMap(ctx context.Context, cmd string, args ...any) (map[string]string, error) {
+	ic, err := p.begin(ctx)
+	if err != nil {
+		return nil, err
+	}
+	v, err := ic.c.DoStringMap(cmd, args...)
+	return v, p.end(ic, err)
+}
+
+// DoInt64Map is Do with Conn.DoInt64Map.
+func (p *Pool) DoInt64Map(ctx context.Context, cmd string, args ...any) (map[string]int64, error) {
+	ic, err := p.begin(ctx)
+	if err != nil {
+		return nil, err
+	}
+	v, err := ic.c.DoInt64Map(cmd, args...)
+	return v, p.end(ic, err)
+}
+
+// DoScan is Do with Conn.DoScan.
+func (p *Pool) DoScan(ctx context.Context, cmd string, args ...any) (uint64, []string, error) {
+	ic, err := p.begin(ctx)
+	if err != nil {
+		return 0, nil, err
+	}
+	cursor, items, err := ic.c.DoScan(cmd, args...)
+	return cursor, items, p.end(ic, err)
+}
+
+// Scan iterates over keys returned by Redis SCAN, starting from cursor 0.
+// Each page borrows a connection via DoScan so no connection is held across
+// loop iterations.
+func (p *Pool) Scan(ctx context.Context, args ...any) iter.Seq2[string, error] {
+	return func(yield func(string, error) bool) {
+		callArgs := make([]any, 1+len(args))
+		copy(callArgs[1:], args)
+		var cursor uint64
+		for {
+			callArgs[0] = cursor
+			next, keys, err := p.DoScan(ctx, "SCAN", callArgs...)
+			if err != nil {
+				yield("", err)
+				return
+			}
+			for _, k := range keys {
+				if !yield(k, nil) {
+					return
+				}
+			}
+			if next == 0 {
+				return
+			}
+			cursor = next
+		}
+	}
+}
+
+// WithConn borrows a connection from the pool, passes it to fn, and puts it
+// back when fn returns. Unlike Pool.Get, WithConn does not allocate a
+// PoolConn wrapper and bounds operations inside fn by ctx's deadline.
+func (p *Pool) WithConn(ctx context.Context, fn func(c *Conn) error) error {
+	ic, err := p.begin(ctx)
+	if err != nil {
+		return err
+	}
+	completed := false
+	defer func() {
+		if !completed {
+			ic.c.setLimit(time.Time{})
+			p.closeconn(ic.c)
+		}
+	}()
+	err = fn(ic.c)
+	completed = true
+	return p.end(ic, err)
+}
+
+// Pipeline borrows a connection from the pool, runs fn with a Pipeline bound
+// to it, drains any unread replies if fn returns nil, and returns the
+// connection to the pool.
+func (p *Pool) Pipeline(ctx context.Context, fn func(p *Pipeline) error) error {
+	ic, err := p.begin(ctx)
+	if err != nil {
+		return err
+	}
+	ic.c.pipe = Pipeline{c: ic.c}
+	completed := false
+	defer func() {
+		if !completed {
+			ic.c.pipe = Pipeline{}
+			ic.c.setLimit(time.Time{})
+			p.closeconn(ic.c)
+		}
+	}()
+	err = fn(&ic.c.pipe)
+	if err == nil {
+		err = ic.c.pipe.Drain()
+	}
+	ic.c.pipe = Pipeline{}
+	completed = true
+	return p.end(ic, err)
 }

@@ -80,6 +80,62 @@ func TestRedis(t *testing.T) {
 	if cli.Err() != nil {
 		t.Fatal(cli.Err())
 	}
+
+	// Test ergonomic helpers against real Redis.
+	const prefix = "redisgo:ci:"
+	if err := cli.DoNoReply("DEL", prefix+"ok", prefix+"num", prefix+"hash", prefix+"scan1", prefix+"scan2"); err != nil {
+		t.Fatal(err)
+	}
+	ok, err := cli.DoOK("SET", prefix+"ok", "1", "NX", "EX", 10)
+	if err != nil || !ok {
+		t.Fatal(ok, err)
+	}
+	ok, err = cli.DoOK("SET", prefix+"ok", "2", "NX", "EX", 10)
+	if err != nil || ok {
+		t.Fatal(ok, err)
+	}
+	if n, err := cli.DoInt64("INCRBY", prefix+"num", 5); err != nil || n != 5 {
+		t.Fatal(n, err)
+	}
+	if n, err := cli.DoInt64("GET", prefix+"num"); err != nil || n != 5 {
+		t.Fatal(n, err)
+	}
+	if f, err := cli.DoFloat64("INCRBYFLOAT", prefix+"num", 0.5); err != nil || f != 5.5 {
+		t.Fatal(f, err)
+	}
+	if exists, err := cli.DoBool("EXISTS", prefix+"num"); err != nil || !exists {
+		t.Fatal(exists, err)
+	}
+	if err := cli.DoNoReply("HSET", prefix+"hash", map[string]any{"a": "1", "b": 2}); err != nil {
+		t.Fatal(err)
+	}
+	if m, err := cli.DoStringMap("HGETALL", prefix+"hash"); err != nil || m["a"] != "1" || m["b"] != "2" {
+		t.Fatal(m, err)
+	}
+	if err := cli.DoNoReply("MSET", map[string]string{prefix + "scan1": "1", prefix + "scan2": "2"}); err != nil {
+		t.Fatal(err)
+	}
+	var scanned []string
+	for k, err := range cli.Scan("MATCH", prefix+"scan*", "COUNT", 10) {
+		if err != nil {
+			t.Fatal(err)
+		}
+		scanned = append(scanned, k)
+	}
+	if len(scanned) != 2 {
+		t.Fatalf("expect 2 scanned keys, got %v", scanned)
+	}
+	sc := NewScript(1, "return redis.call('GET', KEYS[1])")
+	r, err := sc.DoConn(cli, prefix+"num")
+	if err != nil {
+		t.Fatal(err)
+	}
+	var scVal float64
+	if err := r.Scan(&scVal); err != nil || scVal != 5.5 {
+		t.Fatal(scVal, err)
+	}
+	r.Free()
+	_ = cli.DoNoReply("DEL", prefix+"ok", prefix+"num", prefix+"hash", prefix+"scan1", prefix+"scan2")
 }
 
 func BenchmarkCmdSetRedisgo(b *testing.B) {
@@ -528,5 +584,145 @@ func TestDoReusesNestedArrays(t *testing.T) {
 	})
 	if allocs != 0 {
 		t.Fatalf("expect 0 allocs, got %v", allocs)
+	}
+}
+
+func TestConnDoAndRecvHelpers(t *testing.T) {
+	resp := "+OK\r\n" +
+		"$-1\r\n" +
+		":42\r\n" +
+		tstr("100") +
+		tstr("200") +
+		tstr("12.5") +
+		":1\r\n" +
+		tcmd(tstr("a"), tstr("b")) +
+		tcmd(":1\r\n", tstr("2")) +
+		tcmd(tstr("1.5"), ":2\r\n") +
+		tcmd(":1\r\n", tstr("false")) +
+		tcmd(tstr("k"), tstr("v")) +
+		tcmd(tstr("c"), ":9\r\n") +
+		tcmd(tstr("5"), tcmd(tstr("k1")))
+
+	c := newTestConn(resp, 0)
+	if ok, err := c.DoOK("SET", "k", "v"); err != nil || !ok {
+		t.Fatal(ok, err)
+	}
+	if ok, err := c.DoOK("SET", "k", "v", "NX"); err != nil || ok {
+		t.Fatal(ok, err)
+	}
+	if v, err := c.DoInt("INCR", "k"); err != nil || v != 42 {
+		t.Fatal(v, err)
+	}
+	if v, err := c.DoInt64("GET", "k"); err != nil || v != 100 {
+		t.Fatal(v, err)
+	}
+	if v, err := c.DoUint64("GET", "k"); err != nil || v != 200 {
+		t.Fatal(v, err)
+	}
+	if v, err := c.DoFloat64("ZSCORE", "z", "m"); err != nil || v != 12.5 {
+		t.Fatal(v, err)
+	}
+	if v, err := c.DoBool("EXISTS", "k"); err != nil || !v {
+		t.Fatal(v, err)
+	}
+	if v, err := c.DoStrings("LRANGE", "l", 0, -1); err != nil || len(v) != 2 || v[1] != "b" {
+		t.Fatal(v, err)
+	}
+	if v, err := c.DoInt64s("SMISMEMBER", "s", "a", "b"); err != nil || len(v) != 2 || v[1] != 2 {
+		t.Fatal(v, err)
+	}
+	if v, err := c.DoFloat64s("X"); err != nil || len(v) != 2 || v[0] != 1.5 || v[1] != 2 {
+		t.Fatal(v, err)
+	}
+	if v, err := c.DoBools("X"); err != nil || len(v) != 2 || !v[0] || v[1] {
+		t.Fatal(v, err)
+	}
+	if v, err := c.DoStringMap("HGETALL", "h"); err != nil || v["k"] != "v" {
+		t.Fatal(v, err)
+	}
+	if v, err := c.DoInt64Map("HGETALL", "h"); err != nil || v["c"] != 9 {
+		t.Fatal(v, err)
+	}
+	if cur, items, err := c.DoScan("SCAN", 0); err != nil || cur != 5 || len(items) != 1 || items[0] != "k1" {
+		t.Fatal(cur, items, err)
+	}
+}
+
+func TestConnNewHelpersNoAlloc(t *testing.T) {
+	cases := []struct {
+		name  string
+		reply string
+		fn    func(c *Conn) error
+		alloc float64
+	}{
+		{"DoOK", "+OK\r\n", func(c *Conn) error { _, err := c.DoOK("SET", "k", "v", "NX"); return err }, 0},
+		{"DoInt64", "$3\r\n123\r\n", func(c *Conn) error { _, err := c.DoInt64("GET", "k"); return err }, 0},
+		{"DoUint64", "$3\r\n123\r\n", func(c *Conn) error { _, err := c.DoUint64("GET", "k"); return err }, 0},
+		{"DoFloat64", "$4\r\n1.25\r\n", func(c *Conn) error { _, err := c.DoFloat64("ZSCORE", "z", "m"); return err }, 0},
+		{"DoBool", ":1\r\n", func(c *Conn) error { _, err := c.DoBool("EXISTS", "k"); return err }, 0},
+		{"RecvNoReply", "+OK\r\n", func(c *Conn) error { c.Send("SET", "k", "v"); return c.RecvNoReply() }, 0},
+		{"RecvOK", "+OK\r\n", func(c *Conn) error { c.Send("SET", "k", "v"); _, err := c.RecvOK(); return err }, 0},
+		{"RecvInt64", "$3\r\n123\r\n", func(c *Conn) error { c.Send("GET", "k"); _, err := c.RecvInt64(); return err }, 0},
+		{"RecvFloat64", "$4\r\n1.25\r\n", func(c *Conn) error { c.Send("GET", "k"); _, err := c.RecvFloat64(); return err }, 0},
+		{"RecvBool", ":1\r\n", func(c *Conn) error { c.Send("EXISTS", "k"); _, err := c.RecvBool(); return err }, 0},
+		{"RecvString", "$5\r\nhello\r\n", func(c *Conn) error { c.Send("GET", "k"); _, err := c.RecvString(); return err }, 1},
+	}
+	for _, tc := range cases {
+		c := NewConn(&FakeConn{reply: []byte(tc.reply)}, WithReadTimeout(0), WithWriteTimeout(0))
+		buf := &c.br.b[0]
+		allocs := testing.AllocsPerRun(200, func() {
+			if err := tc.fn(c); err != nil {
+				t.Fatal(tc.name, err)
+			}
+		})
+		if &c.br.b[0] != buf {
+			t.Errorf("%s: read buffer replaced instead of reused", tc.name)
+		}
+		if allocs != tc.alloc {
+			t.Errorf("%s: expect %v allocs, got %v", tc.name, tc.alloc, allocs)
+		}
+	}
+}
+
+func TestConnScanIter(t *testing.T) {
+	// Multi-page scan with an empty intermediate page, then early break, then error.
+	resp := tcmd(tstr("7"), tcmd(tstr("k1"), tstr("k2"))) +
+		tcmd(tstr("9"), "*0\r\n") +
+		tcmd(tstr("0"), tcmd(tstr("k3"))) +
+		tcmd(tstr("5"), tcmd(tstr("a"), tstr("b"))) +
+		"-ERR scan failed\r\n"
+
+	c := newTestConn(resp, 0)
+	var keys []string
+	for k, err := range c.Scan("MATCH", "k*", "COUNT", 10) {
+		if err != nil {
+			t.Fatal(err)
+		}
+		keys = append(keys, k)
+	}
+	if len(keys) != 3 || keys[0] != "k1" || keys[1] != "k2" || keys[2] != "k3" {
+		t.Fatalf("unexpected keys: %v", keys)
+	}
+
+	// Early break stops iterating without sending extra commands.
+	var early []string
+	for k, err := range c.Scan() {
+		if err != nil {
+			t.Fatal(err)
+		}
+		early = append(early, k)
+		break
+	}
+	if len(early) != 1 || early[0] != "a" {
+		t.Fatalf("unexpected early keys: %v", early)
+	}
+
+	// Error is yielded cleanly.
+	var gotErr error
+	for _, err := range c.Scan() {
+		gotErr = err
+	}
+	if gotErr == nil || gotErr.Error() != "ERR scan failed" {
+		t.Fatalf("expect scan error, got %v", gotErr)
 	}
 }
