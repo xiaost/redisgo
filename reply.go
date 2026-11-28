@@ -18,10 +18,19 @@ const (
 	typeArray
 )
 
-// maxPackBytes bounds the total payload bytes packed into a single backing
-// allocation by Strings, StringMap, and Int64Map so a large multi-bulk reply
-// does not pin all elements together if one string is retained.
+// maxPackBytes bounds the size of each backing buffer allocated when packing
+// strings or byte slices in Strings, StringMap, Int64Map, and Scan so
+// retaining one element never pins more than 4KB.
 const maxPackBytes = 4 << 10
+
+// maxPackElem bounds an individual element eligible for chunk packing; larger
+// elements get their own exact allocation so they neither waste chunk space
+// nor stay pinned to unrelated small elements.
+const maxPackElem = maxPackBytes / 2
+
+// emptyBytes is a non-nil, zero-capacity slice returned for empty bulk/simple
+// strings so callers do not pin the Conn read buffer and append never aliases.
+var emptyBytes = []byte{}
 
 // Reply represents a reply of redis
 type Reply struct {
@@ -98,12 +107,51 @@ func (r *Reply) Bytes() ([]byte, error) {
 	return r.b, nil
 }
 
+func constSimpleString(b []byte) (string, bool) {
+	switch ss(b) {
+	case "OK":
+		return "OK", true
+	case "PONG":
+		return "PONG", true
+	case "QUEUED":
+		return "QUEUED", true
+	}
+	return "", false
+}
+
+// aliasesBuf reports whether any field of r holds non-empty bytes aliasing
+// the Conn read buffer.
+func (r *Reply) aliasesBuf() bool {
+	switch r.t {
+	case typeSString, typeBString, typeError:
+		return len(r.b) > 0
+	case typeArray:
+		return r.arrayAliasesBuf()
+	}
+	return false
+}
+
+func (r *Reply) arrayAliasesBuf() bool {
+	for i := range r.array {
+		if r.array[i].aliasesBuf() {
+			return true
+		}
+	}
+	return false
+}
+
 // String returns a copy of "Simple Strings" or "Bulk Strings" as a string.
 func (r *Reply) String() (string, error) {
-	if r.t != typeSString && r.t != typeBString {
-		return "", r.mismatch()
+	switch r.t {
+	case typeBString:
+		return string(r.b), nil
+	case typeSString:
+		if s, ok := constSimpleString(r.b); ok {
+			return s, nil
+		}
+		return string(r.b), nil
 	}
-	return string(r.b), nil
+	return "", r.mismatch()
 }
 
 // Integer returns int64 of integer protocol:
@@ -226,31 +274,122 @@ func (r *Reply) mismatch() error {
 // BytesSlice returns the elements of an array of strings, with nil for
 // nil elements. The returned slices alias the read buffer of the Conn, see Conn.
 func (r *Reply) BytesSlice() ([][]byte, error) {
+	bb, _, err := r.bytesSlice()
+	return bb, err
+}
+
+func (r *Reply) bytesSlice() ([][]byte, bool, error) {
 	aa, err := r.Array()
 	if err != nil {
-		return nil, err
+		return nil, false, err
 	}
 	ret := make([][]byte, len(aa))
+	exposed := false
 	for i := range aa {
 		if aa[i].t == typeNil {
 			continue
 		}
-		if ret[i], err = aa[i].Bytes(); err != nil {
-			return nil, err
+		b, err := aa[i].Bytes()
+		if err != nil {
+			return nil, false, err
 		}
+		if len(b) > 0 {
+			exposed = true
+		}
+		ret[i] = b
 	}
-	return ret, nil
+	return ret, exposed, nil
 }
 
-// Strings returns the elements of an array of strings, with "" for nil elements.
-func (r *Reply) Strings() ([]string, error) {
+// stringPacker packs small strings (length in [2, maxPackElem]) into <= maxPackBytes
+// backing buffers so multi-bulk replies avoid per-element heap allocations while
+// bounding the memory any single retained string can pin.
+type stringPacker struct {
+	buf []byte
+	off int
+	rem int
+}
+
+func (p *stringPacker) add(r *Reply) {
+	if r.t == typeSString {
+		if _, ok := constSimpleString(r.b); ok {
+			return
+		}
+	}
+	if n := len(r.b); n >= 2 && n <= maxPackElem {
+		p.rem += n
+	}
+}
+
+func (p *stringPacker) grow() {
+	p.buf = make([]byte, min(p.rem, maxPackBytes))
+	p.off = 0
+}
+
+func (p *stringPacker) next(b []byte) string {
+	n := len(b)
+	if n <= 1 || n > maxPackElem {
+		return string(b)
+	}
+	if n > len(p.buf)-p.off {
+		p.grow()
+	}
+	copy(p.buf[p.off:], b)
+	s := ss(p.buf[p.off : p.off+n])
+	p.off += n
+	p.rem -= n
+	return s
+}
+
+func (p *stringPacker) nextSimple(b []byte) string {
+	if s, ok := constSimpleString(b); ok {
+		return s
+	}
+	return p.next(b)
+}
+
+func (p *stringPacker) nextReply(r *Reply) string {
+	if r.t == typeBString {
+		return p.next(r.b)
+	}
+	return p.nextSimple(r.b)
+}
+
+// bytesPacker packs copied byte slices into <= maxPackBytes buffers with cap==len
+// per slice so appending to one element cannot overwrite its neighbor.
+type bytesPacker struct {
+	buf []byte
+	off int
+	rem int
+}
+
+func (p *bytesPacker) next(b []byte) []byte {
+	n := len(b)
+	if n == 0 {
+		return emptyBytes
+	}
+	if n > maxPackElem {
+		c := make([]byte, n)
+		copy(c, b)
+		return c
+	}
+	if n > len(p.buf)-p.off {
+		p.buf = make([]byte, min(p.rem, maxPackBytes))
+		p.off = 0
+	}
+	dst := p.buf[p.off : p.off+n : p.off+n]
+	copy(dst, b)
+	p.off += n
+	p.rem -= n
+	return dst
+}
+
+func (r *Reply) bytesSliceCopy() ([][]byte, error) {
 	aa, err := r.Array()
 	if err != nil {
 		return nil, err
 	}
-	ret := make([]string, len(aa))
-	total := 0
-	pack := true
+	var bp bytesPacker
 	for i := range aa {
 		if aa[i].t == typeNil {
 			continue
@@ -259,45 +398,63 @@ func (r *Reply) Strings() ([]string, error) {
 		if err != nil {
 			return nil, err
 		}
-		if pack {
-			if len(b) > maxPackBytes-total {
-				pack = false
-			} else {
-				total += len(b)
-			}
+		if len(b) > 0 && len(b) <= maxPackElem {
+			bp.rem += len(b)
 		}
 	}
-	if pack {
-		if total == 0 {
-			return ret, nil
-		}
-		buf := make([]byte, total)
-		off := 0
-		for i := range aa {
-			if aa[i].t == typeNil {
-				continue
-			}
-			ret[i] = packCopy(buf, &off, aa[i].b)
-		}
-		return ret, nil
-	}
+	ret := make([][]byte, len(aa))
 	for i := range aa {
-		if aa[i].t == typeNil || len(aa[i].b) == 0 {
+		if aa[i].t == typeNil {
 			continue
 		}
-		ret[i] = string(aa[i].b)
+		ret[i] = bp.next(aa[i].b)
 	}
 	return ret, nil
 }
 
-func packCopy(buf []byte, off *int, src []byte) string {
-	if len(src) == 0 {
-		return ""
+// Strings returns the elements of an array of strings, with "" for nil elements.
+func (r *Reply) Strings() ([]string, error) {
+	return r.appendStrings(nil)
+}
+
+func (r *Reply) appendStrings(dst []string) ([]string, error) {
+	aa, err := r.Array()
+	if err != nil {
+		return nil, err
 	}
-	n := copy(buf[*off:], src)
-	s := ss(buf[*off : *off+n])
-	*off += n
-	return s
+	var sp stringPacker
+	for i := range aa {
+		if aa[i].t == typeNil {
+			continue
+		}
+		if _, err := aa[i].Bytes(); err != nil {
+			return nil, err
+		}
+		sp.add(&aa[i])
+	}
+	if len(aa) == 0 {
+		if dst == nil {
+			return []string{}, nil
+		}
+		return dst[:0], nil
+	}
+	if cap(dst) < len(aa) {
+		dst = make([]string, len(aa))
+	} else {
+		dst = dst[:len(aa)]
+	}
+	for i := range aa {
+		if aa[i].t == typeNil {
+			dst[i] = ""
+			continue
+		}
+		if aa[i].t == typeBString {
+			dst[i] = sp.next(aa[i].b)
+		} else {
+			dst[i] = sp.nextSimple(aa[i].b)
+		}
+	}
+	return dst, nil
 }
 
 func parseSlice[T any](r *Reply, fn func(*Reply) (T, error)) ([]T, error) {
@@ -346,51 +503,33 @@ func (r *Reply) StringMap() (map[string]string, error) {
 	if len(aa)%2 != 0 {
 		return nil, ErrTypeMismatch
 	}
-	total := 0
-	pack := true
+	var sp stringPacker
 	for i := 0; i < len(aa); i += 2 {
-		k, err := aa[i].Bytes()
-		if err != nil {
+		if _, err := aa[i].Bytes(); err != nil {
 			return nil, err
 		}
-		var v []byte
+		sp.add(&aa[i])
 		if aa[i+1].t != typeNil {
-			v, err = aa[i+1].Bytes()
-			if err != nil {
+			if _, err := aa[i+1].Bytes(); err != nil {
 				return nil, err
 			}
-		}
-		if pack {
-			if len(k) > maxPackBytes-total || len(v) > maxPackBytes-total-len(k) {
-				pack = false
-			} else {
-				total += len(k) + len(v)
-			}
+			sp.add(&aa[i+1])
 		}
 	}
 	m := make(map[string]string, len(aa)/2)
-	if len(aa) == 0 {
-		return m, nil
-	}
-	if pack && total > 0 {
-		buf := make([]byte, total)
-		off := 0
-		for i := 0; i < len(aa); i += 2 {
-			ks := packCopy(buf, &off, aa[i].b)
-			var vs string
-			if aa[i+1].t != typeNil {
-				vs = packCopy(buf, &off, aa[i+1].b)
-			}
-			m[ks] = vs
-		}
-		return m, nil
-	}
 	for i := 0; i < len(aa); i += 2 {
-		var vs string
-		if aa[i+1].t != typeNil {
-			vs = string(aa[i+1].b)
+		var ks, vs string
+		if aa[i].t == typeBString {
+			ks = sp.next(aa[i].b)
+		} else {
+			ks = sp.nextSimple(aa[i].b)
 		}
-		m[string(aa[i].b)] = vs
+		if aa[i+1].t == typeBString {
+			vs = sp.next(aa[i+1].b)
+		} else if aa[i+1].t != typeNil {
+			vs = sp.nextSimple(aa[i+1].b)
+		}
+		m[ks] = vs
 	}
 	return m, nil
 }
@@ -404,44 +543,28 @@ func (r *Reply) Int64Map() (map[string]int64, error) {
 	if len(aa)%2 != 0 {
 		return nil, ErrTypeMismatch
 	}
-	total := 0
-	pack := true
+	var sp stringPacker
 	for i := 0; i < len(aa); i += 2 {
-		k, err := aa[i].Bytes()
-		if err != nil {
+		if _, err := aa[i].Bytes(); err != nil {
 			return nil, err
 		}
 		vt := aa[i+1].t
 		if vt != typeInteger && vt != typeSString && vt != typeBString {
 			return nil, aa[i+1].mismatch()
 		}
-		if pack {
-			if len(k) > maxPackBytes-total {
-				pack = false
-			} else {
-				total += len(k)
-			}
-		}
+		sp.add(&aa[i])
 	}
 	m := make(map[string]int64, len(aa)/2)
-	if len(aa) == 0 {
-		return m, nil
-	}
-	var buf []byte
-	off := 0
-	if pack && total > 0 {
-		buf = make([]byte, total)
-	}
 	for i := 0; i < len(aa); i += 2 {
 		v, err := aa[i+1].Int64()
 		if err != nil {
 			return nil, err
 		}
 		var ks string
-		if buf != nil {
-			ks = packCopy(buf, &off, aa[i].b)
+		if aa[i].t == typeBString {
+			ks = sp.next(aa[i].b)
 		} else {
-			ks = string(aa[i].b)
+			ks = sp.nextSimple(aa[i].b)
 		}
 		m[ks] = v
 	}
@@ -449,6 +572,10 @@ func (r *Reply) Int64Map() (map[string]int64, error) {
 }
 
 func (r *Reply) scanResult() (uint64, []string, error) {
+	return r.scanResultInto(nil)
+}
+
+func (r *Reply) scanResultInto(dst []string) (uint64, []string, error) {
 	aa, err := r.Array()
 	if err != nil {
 		return 0, nil, err
@@ -460,7 +587,7 @@ func (r *Reply) scanResult() (uint64, []string, error) {
 	if err != nil {
 		return 0, nil, err
 	}
-	items, err := aa[1].Strings()
+	items, err := aa[1].appendStrings(dst)
 	if err != nil {
 		return 0, nil, err
 	}
@@ -489,8 +616,27 @@ func (r *Reply) Scan(dest ...any) error {
 		if len(dest) > len(r.array) {
 			return ErrTypeMismatch
 		}
+		var sp stringPacker
+		if len(dest) >= 2 {
+			strCount := 0
+			for i, dst := range dest {
+				if d, ok := dst.(*string); ok && d != nil {
+					elem := &r.array[i]
+					if elem.t == typeBString || elem.t == typeSString {
+						prev := sp.rem
+						sp.add(elem)
+						if sp.rem != prev {
+							strCount++
+						}
+					}
+				}
+			}
+			if strCount < 2 {
+				sp.rem = 0
+			}
+		}
 		for i, dst := range dest {
-			if err := scanValue(&r.array[i], dst, true); err != nil {
+			if err := scanValue(&r.array[i], dst, true, &sp); err != nil {
 				return err
 			}
 		}
@@ -499,10 +645,10 @@ func (r *Reply) Scan(dest ...any) error {
 	if len(dest) != 1 {
 		return ErrTypeMismatch
 	}
-	return scanValue(r, dest[0], false)
+	return scanValue(r, dest[0], false, nil)
 }
 
-func scanValue(r *Reply, dst any, allowNil bool) error {
+func scanValue(r *Reply, dst any, allowNil bool, sp *stringPacker) error {
 	if dst == nil {
 		if r.t == typeError {
 			return RedisErr(r.b)
@@ -517,6 +663,10 @@ func scanValue(r *Reply, dst any, allowNil bool) error {
 		}
 		if isNil {
 			*d = ""
+			return nil
+		}
+		if sp != nil && sp.rem > 0 && (r.t == typeBString || r.t == typeSString) {
+			*d = sp.nextReply(r)
 			return nil
 		}
 		v, err := r.String()
@@ -538,13 +688,18 @@ func scanValue(r *Reply, dst any, allowNil bool) error {
 		}
 		if len(b) == 0 {
 			if *d == nil {
-				*d = []byte{}
+				*d = emptyBytes
 			} else {
 				*d = (*d)[:0]
 			}
 			return nil
 		}
-		*d = append((*d)[:0], b...)
+		if cap(*d) >= len(b) {
+			*d = (*d)[:len(b)]
+			copy(*d, b)
+		} else {
+			*d = append([]byte(nil), b...)
+		}
 	case *int:
 		if d == nil {
 			return ErrInvalidArgType
@@ -631,16 +786,9 @@ func scanValue(r *Reply, dst any, allowNil bool) error {
 			*d = nil
 			return nil
 		}
-		bb, err := r.BytesSlice()
+		bb, err := r.bytesSliceCopy()
 		if err != nil {
 			return err
-		}
-		for i, b := range bb {
-			if b != nil {
-				c := make([]byte, len(b))
-				copy(c, b)
-				bb[i] = c
-			}
 		}
 		*d = bb
 	case *[]int:

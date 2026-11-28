@@ -4,6 +4,7 @@ import (
 	"bufio"
 	"context"
 	"net"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
@@ -258,6 +259,93 @@ func BenchmarkScriptDoInt64(b *testing.B) {
 		if _, err := sc.DoInt64(ctx, p, "counter"); err != nil {
 			b.Fatal(err)
 		}
+	}
+}
+
+func BenchmarkDoStringsLarge(b *testing.B) {
+	b.ReportAllocs()
+	keys := make([]string, 200)
+	for i := range keys {
+		keys[i] = tstr("session:01234567-89ab-cdef-0123-456789ab" + strconv.Itoa(1000+i))
+	}
+	c := benchConn(tcmd(keys...))
+	for b.Loop() {
+		if _, err := c.DoStrings("SMEMBERS", "sessions"); err != nil {
+			b.Fatal(err)
+		}
+	}
+}
+
+func BenchmarkDoStringMapLarge(b *testing.B) {
+	b.ReportAllocs()
+	pairs := make([]string, 200)
+	for i := range 100 {
+		pairs[2*i] = tstr("field_name_long_" + strconv.Itoa(1000+i))
+		pairs[2*i+1] = tstr("field_value_payload_data_long_" + strconv.Itoa(1000+i))
+	}
+	c := benchConn(tcmd(pairs...))
+	for b.Loop() {
+		if _, err := c.DoStringMap("HGETALL", "hash"); err != nil {
+			b.Fatal(err)
+		}
+	}
+}
+
+func BenchmarkSendLarge128KB(b *testing.B) {
+	b.ReportAllocs()
+	val := strings.Repeat("b", 128<<10)
+	c := benchConn("+OK\r\n")
+	for b.Loop() {
+		if err := c.DoNoReply("SET", "bigkey", val); err != nil {
+			b.Fatal(err)
+		}
+	}
+}
+
+func BenchmarkPoolScan(b *testing.B) {
+	b.ReportAllocs()
+	keys := make([]string, 30)
+	for i := range keys {
+		keys[i] = tstr("session:key:" + strconv.Itoa(1000+i))
+	}
+	scanResp := tcmd(tstr("1001"), tcmd(keys[:10]...)) +
+		tcmd(tstr("2002"), "*0\r\n") +
+		tcmd(tstr("3003"), tcmd(keys[10:20]...)) +
+		tcmd(tstr("4004"), "*0\r\n") +
+		tcmd(tstr("0"), tcmd(keys[20:30]...))
+	p := NewPool(func(ctx context.Context) (*Conn, error) {
+		return benchConn(scanResp), nil
+	})
+	ctx := context.Background()
+	for b.Loop() {
+		for _, err := range p.Scan(ctx, "MATCH", "session:*", "COUNT", 10) {
+			if err != nil {
+				b.Fatal(err)
+			}
+		}
+	}
+}
+
+func BenchmarkReplyScanStrings(b *testing.B) {
+	b.ReportAllocs()
+	c := benchConn(tcmd(tstr("alice"), tstr("alice@example.com"), tstr("admin"), tstr("us-west"), tstr("active")))
+	var r Reply
+	if err := c.Recv(&r); err != nil {
+		b.Fatal(err)
+	}
+	for b.Loop() {
+		var s1, s2, s3, s4, s5 string
+		if err := r.Scan(&s1, &s2, &s3, &s4, &s5); err != nil {
+			b.Fatal(err)
+		}
+	}
+}
+
+func BenchmarkNewConn(b *testing.B) {
+	b.ReportAllocs()
+	fc := &FakeConn{}
+	for b.Loop() {
+		_ = NewConn(fc)
 	}
 }
 

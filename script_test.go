@@ -261,3 +261,120 @@ func TestScriptDeadline(t *testing.T) {
 		t.Fatalf("expect DeadlineExceeded, got %v", err)
 	}
 }
+
+func TestScriptBufferReuseOnNoScriptAndNil(t *testing.T) {
+	// DoConn fallback on NOSCRIPT followed by an integer reply should not pin c.br.
+	sc := NewScript(1, "return 42")
+	conn := &scriptedConn{chunkConn: chunkConn{data: []byte("-NOSCRIPT missing\r\n:42\r\n")}}
+	c := NewConn(conn, WithReadTimeout(0), WithWriteTimeout(0))
+	r, err := sc.DoConn(c, "k")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if v, err := r.Int64(); err != nil || v != 42 {
+		t.Fatal(v, err)
+	}
+	r.Free()
+	if c.br.pin != 0 {
+		t.Fatalf("DoConn NOSCRIPT fallback to integer reply pinned read buffer: pin=%d", c.br.pin)
+	}
+
+	// Script.DoBytes on nil reply should not pin read buffer.
+	cNil := NewConn(&FakeConn{reply: []byte("$-1\r\n")}, WithReadTimeout(0), WithWriteTimeout(0))
+	buf := &cNil.br.b[0]
+	p := NewPool(func(ctx context.Context) (*Conn, error) { return cNil, nil })
+	defer p.Close()
+	for range 1000 {
+		if b, err := sc.DoBytes(context.Background(), p, "k"); err != ErrNil || b != nil {
+			t.Fatal(b, err)
+		}
+	}
+	if &cNil.br.b[0] != buf || cNil.br.pin != 0 {
+		t.Fatalf("Script.DoBytes(ErrNil) pinned read buffer: reused=%v pin=%d", &cNil.br.b[0] == buf, cNil.br.pin)
+	}
+}
+
+func TestScriptNestedArgDepth(t *testing.T) {
+	// Nested []any at maxArgDepth-1 (7) levels must succeed identically to
+	// Conn.Do("EVALSHA", ...) in Script.DoInt64, DoConn, SendHash, and Send,
+	// for both keyCount >= 0 and keyCount < 0.
+	deep := []any{"k1", "v1"}
+	for range maxArgDepth - 1 {
+		deep = []any{deep}
+	}
+
+	scFixed := NewScript(1, "return 1")
+	pFixed := NewPool(func(ctx context.Context) (*Conn, error) {
+		return NewConn(&FakeConn{reply: []byte(":1\r\n")}, WithReadTimeout(0), WithWriteTimeout(0)), nil
+	})
+	defer pFixed.Close()
+	if n, err := scFixed.DoInt64(context.Background(), pFixed, deep); err != nil || n != 1 {
+		t.Fatalf("Script(1).DoInt64(depth %d): n=%d err=%v", maxArgDepth-1, n, err)
+	}
+	cConn := NewConn(&FakeConn{reply: []byte(":2\r\n")}, WithReadTimeout(0), WithWriteTimeout(0))
+	r, err := scFixed.DoConn(cConn, deep)
+	if err != nil {
+		t.Fatalf("Script(1).DoConn(depth %d): %v", maxArgDepth-1, err)
+	}
+	r.Free()
+
+	cSend := NewConn(&FakeConn{reply: []byte(":3\r\n:4\r\n")}, WithReadTimeout(0), WithWriteTimeout(0))
+	if err := scFixed.SendHash(cSend, deep); err != nil {
+		t.Fatalf("Script(1).SendHash(depth %d): %v", maxArgDepth-1, err)
+	}
+	if err := scFixed.Send(cSend, deep); err != nil {
+		t.Fatalf("Script(1).Send(depth %d): %v", maxArgDepth-1, err)
+	}
+	if n, err := cSend.RecvInt64(); err != nil || n != 3 {
+		t.Fatalf("SendHash RecvInt64: %d %v", n, err)
+	}
+	if n, err := cSend.RecvInt64(); err != nil || n != 4 {
+		t.Fatalf("Send RecvInt64: %d %v", n, err)
+	}
+
+	scDyn := NewScript(-1, "return 1")
+	pDyn := NewPool(func(ctx context.Context) (*Conn, error) {
+		return NewConn(&FakeConn{reply: []byte(":5\r\n")}, WithReadTimeout(0), WithWriteTimeout(0)), nil
+	})
+	defer pDyn.Close()
+	if n, err := scDyn.DoInt64(context.Background(), pDyn, 1, deep); err != nil || n != 5 {
+		t.Fatalf("Script(-1).DoInt64(depth %d): n=%d err=%v", maxArgDepth-1, n, err)
+	}
+	r, err = scDyn.DoConn(NewConn(&FakeConn{reply: []byte(":6\r\n")}, WithReadTimeout(0), WithWriteTimeout(0)), 1, deep)
+	if err != nil {
+		t.Fatalf("Script(-1).DoConn(depth %d): %v", maxArgDepth-1, err)
+	}
+	r.Free()
+
+	cDynSend := NewConn(&FakeConn{reply: []byte(":7\r\n:8\r\n")}, WithReadTimeout(0), WithWriteTimeout(0))
+	if err := scDyn.SendHash(cDynSend, 1, deep); err != nil {
+		t.Fatalf("Script(-1).SendHash(depth %d): %v", maxArgDepth-1, err)
+	}
+	if err := scDyn.Send(cDynSend, 1, deep); err != nil {
+		t.Fatalf("Script(-1).Send(depth %d): %v", maxArgDepth-1, err)
+	}
+	if n, err := cDynSend.RecvInt64(); err != nil || n != 7 {
+		t.Fatalf("Script(-1) SendHash RecvInt64: %d %v", n, err)
+	}
+	if n, err := cDynSend.RecvInt64(); err != nil || n != 8 {
+		t.Fatalf("Script(-1) Send RecvInt64: %d %v", n, err)
+	}
+
+	// Stack-backed []byte passed to Script.DoInt64 must remain 0 allocs.
+	pStack := NewPool(func(ctx context.Context) (*Conn, error) {
+		return NewConn(&FakeConn{reply: []byte(":42\r\n")}, WithReadTimeout(0), WithWriteTimeout(0)), nil
+	})
+	defer pStack.Close()
+	ctx := context.Background()
+	allocs := testing.AllocsPerRun(200, func() {
+		var key [8]byte
+		copy(key[:], "counter")
+		n, err := scFixed.DoInt64(ctx, pStack, key[:7])
+		if err != nil || n != 42 {
+			t.Fatal(n, err)
+		}
+	})
+	if allocs != 0 {
+		t.Fatalf("Script.DoInt64(stack []byte): expect 0 allocs, got %v", allocs)
+	}
+}

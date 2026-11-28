@@ -851,3 +851,306 @@ func TestResetUnhidesAfterScalar(t *testing.T) {
 		t.Fatalf("hidden nested array of %d not cleared after scalar reply", cap(aa[0].array))
 	}
 }
+
+func TestReplyChunkedPacking(t *testing.T) {
+	// 200 x 44B strings = 8.8KB (> maxPackBytes): packed into 3 chunks + 1 slice = 4 allocs.
+	keys200 := make([]string, 200)
+	for i := range keys200 {
+		keys200[i] = tstr("session:01234567-89ab-cdef-0123-456789ab" + strconv.Itoa(1000+i))
+	}
+	c := NewConn(&FakeConn{reply: []byte(tcmd(keys200...))}, WithReadTimeout(0), WithWriteTimeout(0))
+	// Warm up read buffer so it grows to fit the 10KB multi-bulk reply.
+	if ss, err := c.DoStrings("SMEMBERS", "k"); err != nil || len(ss) != 200 || ss[0] != "session:01234567-89ab-cdef-0123-456789ab1000" || ss[199] != "session:01234567-89ab-cdef-0123-456789ab1199" {
+		t.Fatal(len(ss), err)
+	}
+	allocs := testing.AllocsPerRun(50, func() {
+		ss, err := c.DoStrings("SMEMBERS", "k")
+		if err != nil || len(ss) != 200 {
+			t.Fatal(len(ss), err)
+		}
+	})
+	if allocs != 4 {
+		t.Fatalf("DoStrings(200 x 44B): expect 4 allocs (slice + 3 chunks), got %v", allocs)
+	}
+	buf := &c.br.b[0]
+	for range 20 {
+		if ss, err := c.DoStrings("SMEMBERS", "k"); err != nil || len(ss) != 200 {
+			t.Fatal(len(ss), err)
+		}
+	}
+	if &c.br.b[0] != buf {
+		t.Fatal("multi-bulk read buffer was not reused after warmup")
+	}
+
+	// Mixed 19 small + 1 large (5KB): 1 slice + 1 chunk + 1 large string = 3 allocs.
+	big := strings.Repeat("L", maxPackBytes+1000)
+	mixed := make([]string, 20)
+	for i := range 19 {
+		mixed[i] = tstr("small-val-" + strconv.Itoa(i))
+	}
+	mixed[19] = tstr(big)
+	cMixed := NewConn(&FakeConn{reply: []byte(tcmd(mixed...))}, WithReadTimeout(0), WithWriteTimeout(0))
+	if ss, err := cMixed.DoStrings("MGET", "k"); err != nil || len(ss) != 20 || ss[18] != "small-val-18" || ss[19] != big {
+		t.Fatal(len(ss), err)
+	}
+	allocs = testing.AllocsPerRun(50, func() {
+		ss, err := cMixed.DoStrings("MGET", "k")
+		if err != nil || len(ss) != 20 {
+			t.Fatal(len(ss), err)
+		}
+	})
+	if allocs != 3 {
+		t.Fatalf("DoStrings(19 small + 1 large): expect 3 allocs, got %v", allocs)
+	}
+
+	// Single-byte strings and constant simple strings (+OK/+PONG/+QUEUED): 1 alloc (slice only).
+	cConst := NewConn(&FakeConn{reply: []byte("*6\r\n$1\r\n0\r\n$1\r\n1\r\n$0\r\n\r\n+OK\r\n+PONG\r\n+QUEUED\r\n")}, WithReadTimeout(0), WithWriteTimeout(0))
+	allocs = testing.AllocsPerRun(50, func() {
+		ss, err := cConst.DoStrings("EXEC")
+		if err != nil || len(ss) != 6 || ss[0] != "0" || ss[1] != "1" || ss[2] != "" || ss[3] != "OK" || ss[4] != "PONG" || ss[5] != "QUEUED" {
+			t.Fatal(ss, err)
+		}
+	})
+	if allocs != 1 {
+		t.Fatalf("DoStrings(1-byte + const simple strings): expect 1 alloc, got %v", allocs)
+	}
+
+	// StringMap with 100 fields (~5.4KB > maxPackBytes): chunked packing avoids 200 per-string allocs.
+	pairs := make([]string, 200)
+	for i := range 100 {
+		pairs[2*i] = tstr("field_name_long_" + strconv.Itoa(1000+i))
+		pairs[2*i+1] = tstr("field_value_payload_data_long_" + strconv.Itoa(1000+i))
+	}
+	cMap := NewConn(&FakeConn{reply: []byte(tcmd(pairs...))}, WithReadTimeout(0), WithWriteTimeout(0))
+	if m, err := cMap.DoStringMap("HGETALL", "h"); err != nil || len(m) != 100 || m["field_name_long_1099"] != "field_value_payload_data_long_1099" {
+		t.Fatal(len(m), err)
+	}
+	allocs = testing.AllocsPerRun(30, func() {
+		m, err := cMap.DoStringMap("HGETALL", "h")
+		if err != nil || len(m) != 100 {
+			t.Fatal(len(m), err)
+		}
+	})
+	if allocs > 10 {
+		t.Fatalf("DoStringMap(100 fields): expect <= 10 allocs with chunk packing, got %v", allocs)
+	}
+
+	// Int64Map with 100 fields (~4.4KB keys > maxPackBytes).
+	ipairs := make([]string, 200)
+	for i := range 100 {
+		ipairs[2*i] = tstr("counter_key_name_long_enough_to_exceed_4k_" + strconv.Itoa(1000+i))
+		ipairs[2*i+1] = ":" + strconv.Itoa(i) + "\r\n"
+	}
+	cIMap := NewConn(&FakeConn{reply: []byte(tcmd(ipairs...))}, WithReadTimeout(0), WithWriteTimeout(0))
+	if m, err := cIMap.DoInt64Map("HGETALL", "h"); err != nil || len(m) != 100 || m["counter_key_name_long_enough_to_exceed_4k_1042"] != 42 {
+		t.Fatal(len(m), err)
+	}
+	allocs = testing.AllocsPerRun(30, func() {
+		m, err := cIMap.DoInt64Map("HGETALL", "h")
+		if err != nil || len(m) != 100 {
+			t.Fatal(len(m), err)
+		}
+	})
+	if allocs > 10 {
+		t.Fatalf("DoInt64Map(100 fields): expect <= 10 allocs with chunk packing, got %v", allocs)
+	}
+}
+
+func TestReplyScanPackingAndIsolation(t *testing.T) {
+	// Multiple *string destinations pack into 1 buffer allocation.
+	c := NewConn(&FakeConn{reply: []byte(tcmd(tstr("alice"), tstr("alice@example.com"), tstr("admin"), tstr("us-west"), tstr("active")))}, WithReadTimeout(0), WithWriteTimeout(0))
+	var r Reply
+	if err := c.Recv(&r); err != nil {
+		t.Fatal(err)
+	}
+	allocs := testing.AllocsPerRun(50, func() {
+		var s1, s2, s3, s4, s5 string
+		if err := r.Scan(&s1, &s2, &s3, &s4, &s5); err != nil {
+			t.Fatal(err)
+		}
+		if s1 != "alice" || s2 != "alice@example.com" || s3 != "admin" || s4 != "us-west" || s5 != "active" {
+			t.Fatal(s1, s2, s3, s4, s5)
+		}
+	})
+	if allocs != 1 {
+		t.Fatalf("Reply.Scan(5 *string): expect 1 packed alloc, got %v", allocs)
+	}
+
+	// Mixed *string destinations: +OK, 1-byte, 5KB, nil, and two small strings.
+	big := strings.Repeat("Z", maxPackBytes+500)
+	cMix := newTestConn(tcmd("+OK\r\n", tstr("x"), tstr("hello"), tstr(big), "$-1\r\n", tstr("world")), 0)
+	if err := cMix.Recv(&r); err != nil {
+		t.Fatal(err)
+	}
+	var a, b, d, e, f, g string
+	if err := r.Scan(&a, &b, &d, &e, &f, &g); err != nil {
+		t.Fatal(err)
+	}
+	if a != "OK" || b != "x" || d != "hello" || e != big || f != "" || g != "world" {
+		t.Fatalf("unexpected mixed Scan: %q %q %q len=%d %q %q", a, b, d, len(e), f, g)
+	}
+
+	// *[][]byte packs copies into 2 allocs (slice + packed buf) and isolates cap==len.
+	elems := make([]string, 10)
+	for i := range elems {
+		elems[i] = tstr("elem-" + strconv.Itoa(i))
+	}
+	cBB := NewConn(&FakeConn{reply: []byte(tcmd(tcmd(elems...)))}, WithReadTimeout(0), WithWriteTimeout(0))
+	var rBB Reply
+	if err := cBB.Recv(&rBB); err != nil {
+		t.Fatal(err)
+	}
+	allocs = testing.AllocsPerRun(50, func() {
+		var out [][]byte
+		if err := rBB.Scan(&out); err != nil {
+			t.Fatal(err)
+		}
+		if len(out) != 10 || string(out[9]) != "elem-9" {
+			t.Fatal(len(out))
+		}
+	})
+	if allocs != 2 {
+		t.Fatalf("Reply.Scan(*[][]byte 10 elems): expect 2 allocs, got %v", allocs)
+	}
+
+	// Verify cap==len isolation: appending to out[0] must NOT clobber out[1].
+	var out [][]byte
+	if err := rBB.Scan(&out); err != nil {
+		t.Fatal(err)
+	}
+	if cap(out[0]) != len(out[0]) {
+		t.Fatalf("expect cap==len for packed [][]byte element, got len=%d cap=%d", len(out[0]), cap(out[0]))
+	}
+	out[0] = append(out[0], "MUTATED"...)
+	if string(out[1]) != "elem-1" {
+		t.Fatalf("append on out[0] clobbered out[1]: %q", out[1])
+	}
+
+	// Verify nil vs empty ($0) in *[][]byte.
+	cBBEdge := newTestConn(tcmd(tcmd("$-1\r\n", "$0\r\n\r\n", tstr(big), tstr("ok"))), 0)
+	if err := cBBEdge.Recv(&rBB); err != nil {
+		t.Fatal(err)
+	}
+	var edge [][]byte
+	if err := rBB.Scan(&edge); err != nil {
+		t.Fatal(err)
+	}
+	if len(edge) != 4 || edge[0] != nil || edge[1] == nil || len(edge[1]) != 0 || cap(edge[1]) != 0 ||
+		string(edge[2]) != big || string(edge[3]) != "ok" {
+		t.Fatalf("unexpected *[][]byte edge values: %v", edge)
+	}
+}
+
+func TestReplyScanPackingEdgeCases(t *testing.T) {
+	// Error partway through when *string packing is active: &s1, &badInt, &s3.
+	c := newTestConn(tcmd(tstr("first"), tstr("notanint"), tstr("third")), 0)
+	var r Reply
+	if err := c.Recv(&r); err != nil {
+		t.Fatal(err)
+	}
+	var s1, s3 string
+	var badInt int
+	if err := r.Scan(&s1, &badInt, &s3); err == nil {
+		t.Fatal("expected parse error for badInt")
+	}
+	if s1 != "first" || s3 != "" {
+		t.Fatalf("unexpected partial Scan state: s1=%q s3=%q", s1, s3)
+	}
+
+	// Error at first element before any packed string allocation: &badInt, &s2, &s3.
+	c2 := newTestConn(tcmd(tstr("notanint"), tstr("second"), tstr("third")), 0)
+	if err := c2.Recv(&r); err != nil {
+		t.Fatal(err)
+	}
+	var s2 string
+	s3 = ""
+	if err := r.Scan(&badInt, &s2, &s3); err == nil {
+		t.Fatal("expected parse error")
+	}
+	if s2 != "" || s3 != "" {
+		t.Fatalf("unexpected mutation after early error: s2=%q s3=%q", s2, s3)
+	}
+
+	// Typed nil (*string)(nil) midway through packed *string destinations.
+	c3 := newTestConn(tcmd(tstr("alpha"), tstr("beta"), tstr("gamma")), 0)
+	if err := c3.Recv(&r); err != nil {
+		t.Fatal(err)
+	}
+	s1, s3 = "", ""
+	if err := r.Scan(&s1, (*string)(nil), &s3); err != ErrInvalidArgType {
+		t.Fatalf("expect ErrInvalidArgType, got %v", err)
+	}
+	if s1 != "alpha" || s3 != "" {
+		t.Fatalf("unexpected state after nil *string: s1=%q s3=%q", s1, s3)
+	}
+
+	// Duplicate destination pointer (&dup, &dup).
+	c4 := newTestConn(tcmd(tstr("one"), tstr("two")), 0)
+	if err := c4.Recv(&r); err != nil {
+		t.Fatal(err)
+	}
+	var dup string
+	if err := r.Scan(&dup, &dup); err != nil || dup != "two" {
+		t.Fatalf("duplicate dest: dup=%q err=%v", dup, err)
+	}
+
+	// Skipped nil dest with typeError must still surface RedisErr.
+	c5 := newTestConn(tcmd(tstr("first"), "-ERR middle\r\n", tstr("third")), 0)
+	if err := c5.Recv(&r); err != nil {
+		t.Fatal(err)
+	}
+	s1, s3 = "", ""
+	if err := r.Scan(&s1, nil, &s3); err == nil || err.Error() != "ERR middle" {
+		t.Fatalf("expect ERR middle, got %v", err)
+	}
+
+	// Boundary element lengths: maxPackElem (2048), maxPackElem+1 (2049), chunk split (>4096),
+	// +OK, +CUSTOM, $0, $1, nil.
+	s2048a := strings.Repeat("A", maxPackElem)
+	s2048b := strings.Repeat("B", maxPackElem)
+	s2048c := strings.Repeat("C", maxPackElem)
+	s2049 := strings.Repeat("D", maxPackElem+1)
+	c6 := newTestConn(tcmd(
+		"+OK\r\n",
+		"+CUSTOM\r\n",
+		"$0\r\n\r\n",
+		"$1\r\nx\r\n",
+		"$-1\r\n",
+		tstr(s2048a),
+		tstr(s2049),
+		tstr(s2048b),
+		tstr(s2048c),
+	), 0)
+	if err := c6.Recv(&r); err != nil {
+		t.Fatal(err)
+	}
+	var d0, d1, d2, d3, d4, d5, d6, d7, d8 string
+	if err := r.Scan(&d0, &d1, &d2, &d3, &d4, &d5, &d6, &d7, &d8); err != nil {
+		t.Fatal(err)
+	}
+	if d0 != "OK" || d1 != "CUSTOM" || d2 != "" || d3 != "x" || d4 != "" ||
+		d5 != s2048a || d6 != s2049 || d7 != s2048b || d8 != s2048c {
+		t.Fatalf("boundary scan mismatch: %q %q %q %q %q lens=(%d,%d,%d,%d)",
+			d0, d1, d2, d3, d4, len(d5), len(d6), len(d7), len(d8))
+	}
+
+	// Stack-backed *[]byte must not escape to heap when reply fits in capacity.
+	c7 := newTestConn(tcmd(tstr("hello"), ":99\r\n"), 0)
+	if err := c7.Recv(&r); err != nil {
+		t.Fatal(err)
+	}
+	allocs := testing.AllocsPerRun(100, func() {
+		var buf [16]byte
+		raw := buf[:0]
+		var n int64
+		if err := r.Scan(&raw, &n); err != nil {
+			t.Fatal(err)
+		}
+		if string(raw) != "hello" || n != 99 {
+			t.Fatal("unexpected stack scan")
+		}
+	})
+	if allocs != 0 {
+		t.Fatalf("Reply.Scan(stack *[]byte): expect 0 allocs, got %v", allocs)
+	}
+}

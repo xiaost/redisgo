@@ -29,12 +29,13 @@ type readDeadliner interface {
 // Bytes that have been consumed but never exposed to the user are the
 // exception, see reclaim and expose.
 type reader struct {
-	rd  io.Reader
-	b   []byte
-	r   int
-	w   int
-	sz  int
-	pin int // b[:pin] may be referenced by exposed replies, pin <= r
+	rd   io.Reader
+	b    []byte
+	r    int
+	w    int
+	sz   int
+	pin  int // b[:pin] may be referenced by exposed replies, pin <= r
+	safe int // >= 0: no in-flight slice references b[pin:safe]; < 0: standalone/exposed
 
 	// A read deadline of now+timeout, or limit if earlier, is set before
 	// the first read from rd after disarm, so replies already buffered cost
@@ -48,16 +49,21 @@ type reader struct {
 	byLimit  bool // the last deadline set, read or write, is limit
 }
 
-func newReader(r io.Reader, sz int) *reader {
+func (r *reader) init(rd io.Reader, sz int) {
 	if sz < minReadBufferSize {
 		sz = minReadBufferSize
 	}
-	br := new(reader)
-	br.rd = r
-	br.dl, _ = r.(readDeadliner)
-	br.b = make([]byte, sz)
-	br.sz = sz
-	return br
+	r.rd = rd
+	r.dl, _ = rd.(readDeadliner)
+	r.b = make([]byte, sz)
+	r.sz = sz
+	r.safe = -1
+}
+
+func newReader(r io.Reader, sz int) *reader {
+	var br reader
+	br.init(r, sz)
+	return &br
 }
 
 // disarm makes the next read from rd set a new read deadline.
@@ -69,6 +75,7 @@ func (r *reader) disarm() {
 // user, so it is never overwritten.
 func (r *reader) expose() {
 	r.pin = r.r
+	r.safe = -1
 }
 
 // drop lets go of a drained buffer larger than reclaim reuses, so the conn
@@ -77,17 +84,54 @@ func (r *reader) expose() {
 func (r *reader) drop() {
 	if r.r == r.w && len(r.b) > max(r.sz, maxReuseBuf) {
 		r.b, r.r, r.w, r.pin = nil, 0, 0, 0
+		if r.safe >= 0 {
+			r.safe = 0
+		}
 	}
 }
 
 // reclaim makes the space of the bytes consumed since the last expose
 // reusable. It must only be called between replies, after everything that
-// referenced those bytes has been copied or dropped. It only takes effect
-// when no unread data is buffered, so nothing has to be moved.
+// referenced those bytes has been copied or dropped. When unread pipelined
+// bytes remain and the tail is nearly full, it shifts them down to pin once
+// enough dead space has accumulated to amortize the copy.
 func (r *reader) reclaim() {
-	if r.r == r.w && len(r.b) <= max(r.sz, maxReuseBuf) {
-		r.r, r.w = r.pin, r.pin
+	if r.r == r.w {
+		if len(r.b) <= max(r.sz, maxReuseBuf) {
+			r.r, r.w = r.pin, r.pin
+		}
+	} else if r.r > r.pin {
+		r.reclaimShift()
 	}
+	r.safe = r.r
+}
+
+func (r *reader) reclaimShift() {
+	if len(r.b) <= max(r.sz, maxReuseBuf) && len(r.b)-r.w < minReadBufferSize && r.r-r.pin >= r.w-r.r {
+		n := copy(r.b[r.pin:], r.b[r.r:r.w])
+		r.r = r.pin
+		r.w = r.pin + n
+	}
+}
+
+// compact shifts unread bytes down to pin when nothing in the current reply
+// references b[pin:r] and doing so provides at least need free bytes in a
+// reusable buffer.
+func (r *reader) compact(need int) bool {
+	if r.safe < 0 || r.r != r.safe || r.r <= r.pin {
+		return false
+	}
+	if len(r.b) > max(r.sz, maxReuseBuf) {
+		return false
+	}
+	if len(r.b)-r.pin-r.buffered() < need {
+		return false
+	}
+	n := copy(r.b[r.pin:], r.b[r.r:r.w])
+	r.r = r.pin
+	r.w = r.pin + n
+	r.safe = r.pin
+	return true
 }
 
 func (r *reader) buffered() int {
@@ -109,6 +153,19 @@ func (r *reader) buf() []byte {
 // grow replaces the buffer with a new one of at least sz bytes holding the
 // buffered data. The old buffer stays intact for slices handed out earlier.
 func (r *reader) grow(sz int) {
+	if limit := max(r.sz, maxReuseBuf); r.safe >= 0 && r.r > r.safe && len(r.b) <= limit && (r.pin == 0 || r.r-r.safe >= r.sz) {
+		// Mid-reply growth on a buffer when unpinned or when the current reply
+		// already exceeded r.sz (e.g. a multi-bulk array larger than r.b): grow
+		// geometrically up to the reuse limit so subsequent replies of the same
+		// size fit in one buffer and read.
+		cap2 := limit
+		if len(r.b) < limit/2 {
+			cap2 = 2 * len(r.b)
+		}
+		if sz < cap2 {
+			sz = cap2
+		}
+	}
 	if sz < r.sz {
 		sz = r.sz
 	}
@@ -117,6 +174,9 @@ func (r *reader) grow(sz int) {
 	r.r = 0
 	r.w = copy(r.b, b)
 	r.pin = 0
+	if r.safe >= 0 {
+		r.safe = 0
+	}
 }
 
 // read reads from rd into the free space of the buffer, setting the read
@@ -159,7 +219,7 @@ func (r *reader) deadline(timeout time.Duration) time.Time {
 
 // readmore reads at least n more bytes into the buffer.
 func (r *reader) readmore(n int) error {
-	if r.free() < n {
+	if r.free() < n && !r.compact(n) {
 		// leave room for the header of a reply of the same size, so a
 		// reused buffer fits it
 		r.grow(r.buffered() + n + minReadBufferSize)
@@ -201,7 +261,7 @@ func (r *reader) Read(n int) (b []byte, err error) {
 // fillmore reads whatever is available into the buffer, growing it
 // geometrically when it is nearly full.
 func (r *reader) fillmore() error {
-	if r.free() < minReadBufferSize {
+	if r.free() < minReadBufferSize && !r.compact(minReadBufferSize) {
 		r.grow(2 * r.buffered())
 	}
 	for empty := 0; ; empty++ {

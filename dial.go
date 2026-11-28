@@ -143,15 +143,16 @@ func dialWithOptions(ctx context.Context, addr string, o options) (*Conn, error)
 	if o.network == "" {
 		o.network = "tcp"
 	}
-	d := net.Dialer{Timeout: o.dialTimeout}
 	var (
 		nc  net.Conn
 		err error
 	)
 	if o.tlsConfig != nil {
-		td := tls.Dialer{NetDialer: &d, Config: o.tlsConfig}
+		td := tls.Dialer{NetDialer: &net.Dialer{Timeout: o.dialTimeout}, Config: o.tlsConfig}
 		nc, err = td.DialContext(ctx, o.network, addr)
 	} else {
+		var d net.Dialer
+		d.Timeout = o.dialTimeout
 		nc, err = d.DialContext(ctx, o.network, addr)
 	}
 	if err != nil {

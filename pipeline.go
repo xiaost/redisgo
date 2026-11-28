@@ -252,7 +252,7 @@ func (p *Pipeline) Drain() error {
 		}
 		if pending == nil && r.t == typeError {
 			pending = RedisErr(r.b)
-			p.c.done(true, pending)
+			p.c.done(len(r.b) > 0, pending)
 		} else {
 			p.c.done(false, nil)
 		}

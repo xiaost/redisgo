@@ -539,31 +539,44 @@ func (p *Pool) DoScan(ctx context.Context, cmd string, args ...any) (uint64, []s
 }
 
 // Scan iterates over keys returned by Redis SCAN, starting from cursor 0.
-// Each page borrows a connection via DoScan so no connection is held across
-// loop iterations.
+// Each page borrows a connection so no connection is held across loop
+// iterations.
 func (p *Pool) Scan(ctx context.Context, args ...any) iter.Seq2[string, error] {
 	return func(yield func(string, error) bool) {
-		callArgs := make([]any, 1+len(args))
-		copy(callArgs[1:], args)
-		var cursor uint64
-		for {
-			callArgs[0] = cursor
-			next, keys, err := p.DoScan(ctx, "SCAN", callArgs...)
-			if err != nil {
-				yield("", err)
-				return
-			}
-			for _, k := range keys {
-				if !yield(k, nil) {
-					return
-				}
-			}
-			if next == 0 {
-				return
-			}
-			cursor = next
-		}
+		p.scan(ctx, args, yield)
 	}
+}
+
+func (p *Pool) scan(ctx context.Context, args []any, yield func(string, error) bool) {
+	var cursor uint64
+	var keys []string
+	for {
+		next, page, err := p.scanPage(ctx, cursor, args, keys)
+		if err != nil {
+			yield("", err)
+			return
+		}
+		keys = page
+		for _, k := range keys {
+			if !yield(k, nil) {
+				return
+			}
+		}
+		clear(keys)
+		if next == 0 {
+			return
+		}
+		cursor = next
+	}
+}
+
+func (p *Pool) scanPage(ctx context.Context, cursor uint64, args []any, dst []string) (uint64, []string, error) {
+	ic, err := p.begin(ctx)
+	if err != nil {
+		return 0, nil, err
+	}
+	next, items, err := ic.c.scanPage(cursor, args, dst)
+	return next, items, p.end(ic, err)
 }
 
 // WithConn borrows a connection from the pool, passes it to fn, and puts it

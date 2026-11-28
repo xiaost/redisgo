@@ -37,23 +37,26 @@ func (s *Script) Src() string {
 	return s.src
 }
 
-func isNoScript(err error) bool {
-	re, ok := err.(RedisErr)
-	return ok && (re.HasPrefix("NOSCRIPT ") || (len(re) == len("NOSCRIPT") && ss(re) == "NOSCRIPT"))
+func isNoScriptReply(r *Reply) bool {
+	if r.t != typeError {
+		return false
+	}
+	re := RedisErr(r.b)
+	return re.HasPrefix("NOSCRIPT ") || (len(re) == len("NOSCRIPT") && ss(re) == "NOSCRIPT")
 }
 
-func (s *Script) callConn(c *Conn, cmd, scriptArg string, keysAndArgs []any) (*Reply, error) {
+func (s *Script) roundtripConn(c *Conn, cmd, scriptArg string, keysAndArgs []any, r *Reply) error {
 	if s.keyCount >= 0 {
-		return c.Do(cmd, scriptArg, s.keyCount, keysAndArgs)
+		return c.roundtrip(cmd, []any{scriptArg, s.keyCount, flatArgs(keysAndArgs)}, r)
 	}
-	return c.Do(cmd, scriptArg, keysAndArgs)
+	return c.roundtrip(cmd, []any{scriptArg, flatArgs(keysAndArgs)}, r)
 }
 
 func (s *Script) callScratch(c *Conn, cmd, scriptArg string, keysAndArgs []any) (*Reply, error) {
 	if s.keyCount >= 0 {
-		return c.do(cmd, []any{scriptArg, s.keyCount, keysAndArgs})
+		return c.do(cmd, []any{scriptArg, s.keyCount, flatArgs(keysAndArgs)})
 	}
-	return c.do(cmd, []any{scriptArg, keysAndArgs})
+	return c.do(cmd, []any{scriptArg, flatArgs(keysAndArgs)})
 }
 
 func (s *Script) do(c *Conn, keysAndArgs []any) (*Reply, error) {
@@ -61,7 +64,7 @@ func (s *Script) do(c *Conn, keysAndArgs []any) (*Reply, error) {
 	if err != nil {
 		return nil, err
 	}
-	if isNoScript(r.Err()) {
+	if isNoScriptReply(r) {
 		c.done(false, nil)
 		return s.callScratch(c, "EVAL", s.src, keysAndArgs)
 	}
@@ -71,17 +74,17 @@ func (s *Script) do(c *Conn, keysAndArgs []any) (*Reply, error) {
 // SendHash sends EVALSHA for the script without waiting for a reply.
 func (s *Script) SendHash(c *Conn, keysAndArgs ...any) error {
 	if s.keyCount >= 0 {
-		return c.Send("EVALSHA", s.hash, s.keyCount, keysAndArgs)
+		return c.Send("EVALSHA", s.hash, s.keyCount, flatArgs(keysAndArgs))
 	}
-	return c.Send("EVALSHA", s.hash, keysAndArgs)
+	return c.Send("EVALSHA", s.hash, flatArgs(keysAndArgs))
 }
 
 // Send sends EVAL for the script without waiting for a reply.
 func (s *Script) Send(c *Conn, keysAndArgs ...any) error {
 	if s.keyCount >= 0 {
-		return c.Send("EVAL", s.src, s.keyCount, keysAndArgs)
+		return c.Send("EVAL", s.src, s.keyCount, flatArgs(keysAndArgs))
 	}
-	return c.Send("EVAL", s.src, keysAndArgs)
+	return c.Send("EVAL", s.src, flatArgs(keysAndArgs))
 }
 
 // Load executes SCRIPT LOAD on p so subsequent EVALSHA calls succeed.
@@ -95,13 +98,19 @@ func (s *Script) DoConn(c *Conn, keysAndArgs ...any) (*Reply, error) {
 	if c == nil {
 		return nil, ErrClosed
 	}
-	r, err := s.callConn(c, "EVALSHA", s.hash, keysAndArgs)
-	if err != nil {
+	r := replyPool.Get().(*Reply)
+	if err := s.roundtripConn(c, "EVALSHA", s.hash, keysAndArgs, r); err != nil {
+		r.Free()
 		return nil, err
 	}
-	if isNoScript(r.Err()) {
-		r.Free()
-		return s.callConn(c, "EVAL", s.src, keysAndArgs)
+	if isNoScriptReply(r) {
+		if err := s.roundtripConn(c, "EVAL", s.src, keysAndArgs, r); err != nil {
+			r.Free()
+			return nil, err
+		}
+	}
+	if r.aliasesBuf() {
+		c.br.expose()
 	}
 	return r, nil
 }
@@ -161,7 +170,7 @@ func (s *Script) DoBytes(ctx context.Context, p *Pool, keysAndArgs ...any) ([]by
 		return nil, p.end(ic, err)
 	}
 	b, err := r.Bytes()
-	ic.c.done(true, err)
+	ic.c.done(len(b) > 0, err)
 	return b, p.end(ic, err)
 }
 
@@ -266,8 +275,8 @@ func (s *Script) DoBytesSlice(ctx context.Context, p *Pool, keysAndArgs ...any) 
 	if err != nil {
 		return nil, p.end(ic, err)
 	}
-	v, err := r.BytesSlice()
-	ic.c.done(true, err)
+	v, exposed, err := r.bytesSlice()
+	ic.c.done(exposed, err)
 	return v, p.end(ic, err)
 }
 

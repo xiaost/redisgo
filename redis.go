@@ -23,10 +23,12 @@ import (
 // retained for long. DoString, DoInteger and DoNoReply return nothing that
 // aliases the buffer (except a RedisErr), which lets the Conn reuse it.
 type Conn struct {
+	lease atomic.Uint64 // first field for 8-byte alignment on 32-bit; counts PoolConn borrows put back
+
 	conn  net.Conn
-	br    *reader
-	bw    *bufio.Writer
-	cmd   []byte   // scratch for commands larger than bw
+	br    reader
+	bw    bufio.Writer
+	cmd   []byte   // scratch for commands larger than bw (up to maxCmdBuf)
 	reply Reply    // scratch for the DoXxx helpers, see do
 	pipe  Pipeline // scratch for Pool.Pipeline
 
@@ -36,7 +38,6 @@ type Conn struct {
 	state  uint8 // session state changed by commands, see track
 	ends   uint8 // states the reply endsIn replies from now ends, see endOnSuccess
 	endsIn int
-	lease  atomic.Uint64 // counts the PoolConn borrows put back, see PoolConn.Close
 
 	createdAt time.Time // set by the Pool that dialed the conn
 
@@ -52,9 +53,9 @@ func NewConn(conn net.Conn, ops ...Option) *Conn {
 func newConn(conn net.Conn, o options) *Conn {
 	var r Conn
 	r.conn = conn
-	r.br = newReader(conn, o.rbuf)
+	r.br.init(conn, o.rbuf)
 	r.br.timeout = o.rtimeout
-	r.bw = bufio.NewWriterSize(conn, o.wbuf)
+	r.bw = *bufio.NewWriterSize(conn, o.wbuf)
 	r.wtimeout = o.wtimeout
 	return &r
 }
@@ -92,7 +93,9 @@ func (c *Conn) Do(cmd string, args ...any) (*Reply, error) {
 		reply.Free()
 		return nil, err
 	}
-	c.br.expose() // reply aliases the read buffer from now on
+	if reply.aliasesBuf() {
+		c.br.expose() // reply aliases the read buffer from now on
+	}
 	return reply, nil
 }
 
@@ -111,7 +114,9 @@ func (c *Conn) roundtrip(cmd string, args []any, reply *Reply) error {
 		}
 		if pending == nil && reply.t == typeError {
 			pending = RedisErr(reply.b)
-			c.br.expose() // pending aliases the read buffer
+			if len(reply.b) > 0 {
+				c.br.expose() // pending aliases the read buffer
+			}
 		}
 	}
 	if err := c.recv(reply); err != nil {
@@ -161,7 +166,8 @@ func (c *Conn) send(cmd string, args []any, do bool) error {
 		return err
 	}
 	c.pd++
-	if cmdSize(cmd, size) <= c.bw.Available() {
+	need := cmdSize(cmd, size)
+	if uint(need) <= uint(c.bw.Available()) {
 		// The command fits: encode it straight into the spare capacity of
 		// the writer. Nothing is flushed, so no write deadline is needed.
 		_, err = c.bw.Write(appendCommand(c.bw.AvailableBuffer(), cmd, n, args))
@@ -171,12 +177,26 @@ func (c *Conn) send(cmd string, args []any, do bool) error {
 	if err := c.armWrite(); err != nil {
 		return c.seterr(err)
 	}
-	c.cmd = appendCommand(c.cmd[:0], cmd, n, args)
-	_, err = c.bw.Write(c.cmd)
-	if cap(c.cmd) > maxCmdBuf {
-		c.cmd = nil // do not pin a huge scratch buffer to the conn
+	if uint(need) <= uint(c.bw.Size()) {
+		// Command fits in an empty write buffer: flush buffered data first
+		// and encode directly into it without allocating c.cmd.
+		if err := c.bw.Flush(); err != nil {
+			return c.seterr(err)
+		}
+		_, err = c.bw.Write(appendCommand(c.bw.AvailableBuffer(), cmd, n, args))
+		return c.seterr(err)
 	}
-	return c.seterr(err)
+	if uint(need) <= maxCmdBuf {
+		// Pre-size the reusable scratch buffer once so append never reallocates.
+		if cap(c.cmd) < need {
+			c.cmd = make([]byte, 0, need)
+		}
+		c.cmd = appendCommand(c.cmd[:0], cmd, n, args)
+		_, err = c.bw.Write(c.cmd)
+		return c.seterr(err)
+	}
+	// Stream commands larger than maxCmdBuf through a pooled chunk buffer.
+	return c.seterr(writeCommand(&c.bw, cmd, n, args))
 }
 
 // Flush writes any buffered data to redis
@@ -228,7 +248,9 @@ func (c *Conn) Recv(reply *Reply) error {
 	if err := c.recv(reply); err != nil {
 		return err // the conn has failed, nothing is read any more
 	}
-	c.br.expose() // reply aliases the read buffer from now on
+	if reply.aliasesBuf() {
+		c.br.expose() // reply aliases the read buffer from now on
+	}
 	return nil
 }
 
@@ -383,7 +405,11 @@ func (c *Conn) read(r *Reply, depth int) (err error) {
 	var n int // for strlen or arraylen
 	switch t {
 	case '+': // Simple Strings
-		r.b = b
+		if len(b) == 0 {
+			r.b = emptyBytes
+		} else {
+			r.b = b
+		}
 		r.t = typeSString
 	case '$': // Bulk Strings
 		if n, err = parseLen(b); err != nil {
@@ -393,13 +419,20 @@ func (c *Conn) read(r *Reply, depth int) (err error) {
 			r.t = typeNil
 			return
 		}
+		if depth == 0 && c.br.safe >= 0 {
+			c.br.safe = c.br.r // header parsed and not retained
+		}
 		if r.b, err = c.br.Read(n + 2); err != nil {
 			return
 		}
 		if r.b[n] != CR || r.b[n+1] != LF {
 			return ErrProtocol
 		}
-		r.b = r.b[:n:n]
+		if n == 0 {
+			r.b = emptyBytes
+		} else {
+			r.b = r.b[:n:n]
+		}
 		r.t = typeBString
 	case ':': // Integers
 		if r.i, err = parseInt(b); err != nil {
@@ -416,6 +449,9 @@ func (c *Conn) read(r *Reply, depth int) (err error) {
 		}
 		if depth >= maxDepth {
 			return ErrProtocol
+		}
+		if depth == 0 && c.br.safe >= 0 {
+			c.br.safe = c.br.r // header parsed and not retained
 		}
 		if r.array == nil || cap(r.array) < n {
 			r.array = make([]Reply, 0, min(n, maxArrayPrealloc))
@@ -437,7 +473,11 @@ func (c *Conn) read(r *Reply, depth int) (err error) {
 		}
 		r.t = typeArray
 	case '-': // Errors
-		r.b = b
+		if len(b) == 0 {
+			r.b = emptyBytes
+		} else {
+			r.b = b
+		}
 		r.t = typeError
 	default:
 		err = ErrProtocol
@@ -473,9 +513,9 @@ func (c *Conn) recvScratch() (*Reply, error) {
 
 // done releases the scratch reply. Unless exposed, its space in the read
 // buffer is reused, so the caller must have copied what it returns.
-// A RedisErr aliases the buffer and always exposes the reply.
+// A non-empty RedisErr aliases the buffer and always exposes the reply.
 func (c *Conn) done(exposed bool, err error) {
-	if _, ok := err.(RedisErr); ok || exposed {
+	if re, ok := err.(RedisErr); (ok && len(re) > 0) || exposed {
 		c.br.expose()
 	}
 	c.reply.release()
@@ -512,11 +552,11 @@ func (c *Conn) DoBytes(cmd string, args ...any) ([]byte, error) {
 		return nil, err
 	}
 	b, err := r.Bytes()
-	c.done(true, err)
+	c.done(len(b) > 0, err)
 	return b, err
 }
 
-// DoString wraps Do() and Reply.Bytes(), and copies the result into a string.
+// DoString wraps Do() and Reply.String(), copying the result into a string.
 // Unlike DoBytes, the result is safe to retain, and the Conn reuses the
 // buffer space of the reply instead of allocating new buffers.
 func (c *Conn) DoString(cmd string, args ...any) (string, error) {
@@ -524,8 +564,7 @@ func (c *Conn) DoString(cmd string, args ...any) (string, error) {
 	if err != nil {
 		return "", err
 	}
-	b, err := r.Bytes()
-	s := string(b)
+	s, err := r.String()
 	c.done(false, err)
 	return s, err
 }
@@ -538,8 +577,8 @@ func (c *Conn) DoBytesSlice(cmd string, args ...any) ([][]byte, error) {
 	if err != nil {
 		return nil, err
 	}
-	bb, err := r.BytesSlice()
-	c.done(true, err)
+	bb, exposed, err := r.bytesSlice()
+	c.done(exposed, err)
 	return bb, err
 }
 
@@ -692,27 +731,41 @@ func (c *Conn) DoScan(cmd string, args ...any) (uint64, []string, error) {
 // forwarded to each SCAN call.
 func (c *Conn) Scan(args ...any) iter.Seq2[string, error] {
 	return func(yield func(string, error) bool) {
-		callArgs := make([]any, 1+len(args))
-		copy(callArgs[1:], args)
-		var cursor uint64
-		for {
-			callArgs[0] = cursor
-			next, keys, err := c.DoScan("SCAN", callArgs...)
-			if err != nil {
-				yield("", err)
-				return
-			}
-			for _, k := range keys {
-				if !yield(k, nil) {
-					return
-				}
-			}
-			if next == 0 {
-				return
-			}
-			cursor = next
-		}
+		c.scan(args, yield)
 	}
+}
+
+func (c *Conn) scan(args []any, yield func(string, error) bool) {
+	var cursor uint64
+	var keys []string
+	for {
+		next, page, err := c.scanPage(cursor, args, keys)
+		if err != nil {
+			yield("", err)
+			return
+		}
+		keys = page
+		for _, k := range keys {
+			if !yield(k, nil) {
+				return
+			}
+		}
+		clear(keys)
+		if next == 0 {
+			return
+		}
+		cursor = next
+	}
+}
+
+func (c *Conn) scanPage(cursor uint64, args []any, dst []string) (uint64, []string, error) {
+	r, err := c.do("SCAN", []any{cursor, flatArgs(args)})
+	if err != nil {
+		return 0, nil, err
+	}
+	next, items, err := r.scanResultInto(dst)
+	c.done(false, err)
+	return next, items, err
 }
 
 // RecvNoReply receives the next reply and returns Reply.Err().
@@ -746,7 +799,7 @@ func (c *Conn) RecvBytes() ([]byte, error) {
 		return nil, err
 	}
 	b, err := r.Bytes()
-	c.done(true, err)
+	c.done(len(b) > 0, err)
 	return b, err
 }
 
@@ -834,8 +887,8 @@ func (c *Conn) RecvBytesSlice() ([][]byte, error) {
 	if err != nil {
 		return nil, err
 	}
-	bb, err := r.BytesSlice()
-	c.done(true, err)
+	bb, exposed, err := r.bytesSlice()
+	c.done(exposed, err)
 	return bb, err
 }
 
@@ -1061,6 +1114,12 @@ func nthArgAt(args []any, i, depth int) (string, int, bool) {
 				return "", -1, false
 			}
 			i -= len(v)
+		case flatArgs:
+			val, rem, ok := nthArgAt(v, i, depth)
+			if ok || rem < 0 {
+				return val, rem, ok
+			}
+			i = rem
 		case []any:
 			if depth >= maxArgDepth {
 				return "", -1, false

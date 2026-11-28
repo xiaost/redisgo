@@ -1186,3 +1186,41 @@ func TestPoolScanNoDeadlock(t *testing.T) {
 		t.Fatalf("unexpected vals: %v", vals)
 	}
 }
+
+func TestPoolScanAllocs(t *testing.T) {
+	keys := make([]string, 30)
+	for i := range keys {
+		keys[i] = tstr("session:key:" + string(rune('a'+i%26)) + string(rune('0'+i%10)))
+	}
+	scanResp := tcmd(tstr("1001"), tcmd(keys[:10]...)) +
+		tcmd(tstr("2002"), "*0\r\n") +
+		tcmd(tstr("3003"), tcmd(keys[10:20]...)) +
+		tcmd(tstr("4004"), "*0\r\n") +
+		tcmd(tstr("0"), tcmd(keys[20:30]...))
+
+	p := NewPool(func(ctx context.Context) (*Conn, error) {
+		return NewConn(&FakeConn{reply: []byte(scanResp)}, WithReadTimeout(0), WithWriteTimeout(0)), nil
+	})
+	defer p.Close()
+	ctx := context.Background()
+	pat := "session:*"
+
+	allocs := testing.AllocsPerRun(50, func() {
+		count := 0
+		for k, err := range p.Scan(ctx, "MATCH", pat, "COUNT", 10) {
+			if err != nil {
+				t.Fatal(err)
+			}
+			if len(k) == 0 {
+				t.Fatal("empty key")
+			}
+			count++
+		}
+		if count != 30 {
+			t.Fatal(count)
+		}
+	})
+	if allocs != 4 {
+		t.Fatalf("Pool.Scan(5 pages: 3x10 + 2 empty): expect 4 allocs, got %v", allocs)
+	}
+}
