@@ -668,6 +668,36 @@ func TestConnNewHelpersNoAlloc(t *testing.T) {
 		{"RecvFloat64", "$4\r\n1.25\r\n", func(c *Conn) error { c.Send("GET", "k"); _, err := c.RecvFloat64(); return err }, 0},
 		{"RecvBool", ":1\r\n", func(c *Conn) error { c.Send("EXISTS", "k"); _, err := c.RecvBool(); return err }, 0},
 		{"RecvString", "$5\r\nhello\r\n", func(c *Conn) error { c.Send("GET", "k"); _, err := c.RecvString(); return err }, 1},
+		{"RecvScanNoAlloc", tcmd(":42\r\n", tstr("1.25"), ":1\r\n", "+OK\r\n", "$1\r\nx\r\n", "$-1\r\n", tstr("token"), "$0\r\n\r\n"), func() func(c *Conn) error {
+			raw := make([]byte, 0, 16)
+			return func(c *Conn) error {
+				var n int64
+				var f float64
+				var b bool
+				var s1, s2, s3 string
+				var empty []byte
+				c.Send("HMGET", "k", "n", "f", "b", "s1", "s2", "s3", "raw", "empty")
+				return c.RecvScan(&n, &f, &b, &s1, &s2, &s3, &raw, &empty)
+			}
+		}(), 0},
+		{"RecvScanStackBuf", tcmd(":42\r\n", tstr("token")), func(c *Conn) error {
+			var n int64
+			var buf [16]byte
+			raw := buf[:0]
+			c.Send("HMGET", "k", "n", "raw")
+			if err := c.RecvScan(&n, &raw); err != nil {
+				return err
+			}
+			if n != 42 || len(raw) != 5 || raw[0] != 't' {
+				return ErrTypeMismatch
+			}
+			return nil
+		}, 0},
+		{"RecvScanPackedStrings", tcmd(tstr("alice"), tstr("alice@example.com"), tstr("admin")), func(c *Conn) error {
+			var s1, s2, s3 string
+			c.Send("HMGET", "user:1", "name", "email", "role")
+			return c.RecvScan(&s1, &s2, &s3)
+		}, 1},
 	}
 	for _, tc := range cases {
 		c := NewConn(&FakeConn{reply: []byte(tc.reply)}, WithReadTimeout(0), WithWriteTimeout(0))
@@ -1186,6 +1216,8 @@ func TestReadBufferAdversarialAliasing(t *testing.T) {
 		opOversizedString
 		opNestedReply
 		opPendingErrDo
+		opRecvScan
+		opRecvScanErr
 	)
 	type step struct {
 		kind  opKind
@@ -1206,7 +1238,7 @@ func TestReadBufferAdversarialAliasing(t *testing.T) {
 		}
 		for i := range 64 {
 			tag := fmt.Sprintf("item-%03d-%s", i, strings.Repeat(string(rune('a'+i%26)), (i*13)%79+1))
-			switch i % 14 {
+			switch i % 16 {
 			case 0:
 				add(step{kind: opRecvBytes, wire: tstr(tag), want: tag})
 			case 1:
@@ -1248,6 +1280,12 @@ func TestReadBufferAdversarialAliasing(t *testing.T) {
 			case 13:
 				msg := "ERR pend-" + tag
 				add(step{kind: opPendingErrDo, wire: "-" + msg + "\r\n+OK\r\n", want: msg})
+			case 14:
+				a1, a2 := "sc0-"+tag, "sc1-"+tag
+				add(step{kind: opRecvScan, wire: tcmd(tstr(a1), ":"+strconv.Itoa(i)+"\r\n", tstr(a2)), want: strconv.Itoa(i), wants: []string{a1, a2}})
+			case 15:
+				msg := "ERR scan-" + tag
+				add(step{kind: opRecvScanErr, wire: tcmd("+OK\r\n", "-"+msg+"\r\n"), want: msg})
 			}
 		}
 		return steps, []byte(wire.String())
@@ -1372,6 +1410,28 @@ func TestReadBufferAdversarialAliasing(t *testing.T) {
 						t.Fatalf("rbuf=%d chunk=%d step=%d: pending err got %v", rbuf, chunk, idx, err)
 					}
 					pinned = append(pinned, held{[]byte(re), st.want})
+				case opRecvScan:
+					if err := c.Send("HMGET", "k", "a", "b", "c"); err != nil {
+						t.Fatal(err)
+					}
+					var s1 string
+					var n int
+					var b2 []byte
+					if err := c.RecvScan(&s1, &n, &b2); err != nil || s1 != st.wants[0] || strconv.Itoa(n) != st.want || string(b2) != st.wants[1] {
+						t.Fatalf("rbuf=%d chunk=%d step=%d: RecvScan got %q %d %q %v", rbuf, chunk, idx, s1, n, b2, err)
+					}
+					pinned = append(pinned, held{b2, st.wants[1]})
+				case opRecvScanErr:
+					if err := c.Send("EXEC"); err != nil {
+						t.Fatal(err)
+					}
+					var okStr string
+					err := c.RecvScan(&okStr, nil)
+					re, ok := err.(RedisErr)
+					if !ok || re.Error() != st.want || okStr != "OK" {
+						t.Fatalf("rbuf=%d chunk=%d step=%d: RecvScanErr got %q %v", rbuf, chunk, idx, okStr, err)
+					}
+					pinned = append(pinned, held{[]byte(re), st.want})
 				}
 			}
 			for j, h := range pinned {
@@ -1383,5 +1443,235 @@ func TestReadBufferAdversarialAliasing(t *testing.T) {
 				r.Free()
 			}
 		}
+	}
+}
+
+func TestConnRecvScan(t *testing.T) {
+	// 1. Nil *Conn and closed *Conn return ErrClosed.
+	var nilConn *Conn
+	var s string
+	if err := nilConn.RecvScan(&s); err != ErrClosed {
+		t.Fatalf("nil Conn.RecvScan(&s): expect ErrClosed, got %v", err)
+	}
+	if err := nilConn.RecvScan(); err != ErrClosed {
+		t.Fatalf("nil Conn.RecvScan(): expect ErrClosed, got %v", err)
+	}
+	closedConn := newTestConn("+OK\r\n", 0)
+	if err := closedConn.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if err := closedConn.RecvScan(&s); err != ErrClosed {
+		t.Fatalf("closed Conn.RecvScan: expect ErrClosed, got %v", err)
+	}
+
+	// 2. Comprehensive mixed types, nested collections, partial scan, scalar, nil, and non-fatal errors keeping stream in sync.
+	resp := tcmd(tstr("alice"), ":30\r\n", ":-99\r\n", tstr("99"), tstr("1.5"), tstr("true"), tstr("raw"), "$-1\r\n", "$0\r\n\r\n", tstr("skipme")) +
+		tcmd(tcmd(tstr("x"), tstr("y")), tcmd(tstr("a"), tstr("b")), tcmd(":1\r\n", ":2\r\n"), tcmd(":3\r\n", tstr("4")), tcmd(tstr("1.2")), tcmd(":1\r\n"), tcmd(tstr("f"), tstr("v")), tcmd(tstr("n"), ":7\r\n")) +
+		tcmd(tstr("first"), tstr("second"), tstr("third")) + // partial scan
+		tcmd(tstr("ignored")) + // zero-dest scan on array
+		tstr("scalar") +
+		"$-1\r\n" +
+		"*-1\r\n" + // BLPOP timeout / WATCH abort
+		tstr("notanint") + // NumError (must not alias read buffer)
+		tcmd(tstr("onlyone")) + // ErrTypeMismatch (more dests than elements)
+		"+OK\r\n" + // ErrTypeMismatch (zero dests on scalar)
+		tstr("badarg") + // ErrInvalidArgType
+		"-\r\n" + // empty RedisErr
+		"-ERR top-level\r\n" + // top-level RedisErr (must pin buffer)
+		tcmd("+OK\r\n", "-ERR nested-elem\r\n") + // nested RedisErr via nil skip (must pin buffer)
+		tcmd(tstr("v1"), "-ERR nested-typed\r\n") + // nested RedisErr via typed dest (must pin buffer)
+		tcmd(tcmd(tstr("ok"), "-ERR deep-nested\r\n"), "+OK\r\n") + // 2-level nested RedisErr inside *[]string (must pin buffer)
+		strings.Repeat(tstr(strings.Repeat("P", 64)), 64) + // overwrite/grow read buffer after errors
+		"+DONE\r\n"
+
+	c := newTestConn(resp, 0)
+
+	var (
+		name     string
+		age      int
+		i64      int64
+		u64      uint64
+		score    float64
+		active   bool
+		raw      = make([]byte, 0, 16)
+		miss     = "preset"
+		emptyBuf []byte
+	)
+	if err := c.RecvScan(&name, &age, &i64, &u64, &score, &active, &raw, &miss, &emptyBuf, nil); err != nil {
+		t.Fatal(err)
+	}
+	if name != "alice" || age != 30 || i64 != -99 || u64 != 99 || score != 1.5 || !active ||
+		string(raw) != "raw" || miss != "" || emptyBuf == nil || len(emptyBuf) != 0 {
+		t.Fatalf("unexpected RecvScan values: %q %d %d %d %v %v %q %q %v",
+			name, age, i64, u64, score, active, raw, miss, emptyBuf)
+	}
+
+	var (
+		ss   []string
+		bb   [][]byte
+		ii   []int
+		ii64 []int64
+		ff   []float64
+		bo   []bool
+		sm   map[string]string
+		im   map[string]int64
+	)
+	if err := c.RecvScan(&ss, &bb, &ii, &ii64, &ff, &bo, &sm, &im); err != nil {
+		t.Fatal(err)
+	}
+	if len(ss) != 2 || ss[1] != "y" || len(bb) != 2 || string(bb[0]) != "a" || string(bb[1]) != "b" ||
+		len(ii) != 2 || ii[1] != 2 || len(ii64) != 2 || ii64[1] != 4 || len(ff) != 1 || ff[0] != 1.2 ||
+		len(bo) != 1 || !bo[0] || sm["f"] != "v" || im["n"] != 7 {
+		t.Fatal(ss, bb, ii, ii64, ff, bo, sm, im)
+	}
+
+	// Partial array scan + zero-dest scan on array.
+	var p0 string
+	if err := c.RecvScan(&p0); err != nil || p0 != "first" {
+		t.Fatalf("partial RecvScan: %q %v", p0, err)
+	}
+	if err := c.RecvScan(); err != nil {
+		t.Fatalf("zero-dest array RecvScan: %v", err)
+	}
+
+	// Scalar reply.
+	if err := c.RecvScan(&s); err != nil || s != "scalar" {
+		t.Fatalf("scalar RecvScan: %q %v", s, err)
+	}
+
+	// Nil bulk and nil array replies return ErrNil.
+	if err := c.RecvScan(&s); err != ErrNil {
+		t.Fatalf("nil bulk RecvScan: expect ErrNil, got %v", err)
+	}
+	if err := c.RecvScan(&s, &age); err != ErrNil {
+		t.Fatalf("nil array RecvScan: expect ErrNil, got %v", err)
+	}
+
+	// Parse error (*strconv.NumError), ErrTypeMismatch, ErrInvalidArgType keep stream synced.
+	numErr := c.RecvScan(&i64)
+	if numErr == nil {
+		t.Fatal("expect NumError")
+	}
+	numErrWant := numErr.Error()
+
+	if err := c.RecvScan(&name, &age); err != ErrTypeMismatch {
+		t.Fatalf("short array RecvScan: expect ErrTypeMismatch, got %v", err)
+	}
+	if err := c.RecvScan(); err != ErrTypeMismatch {
+		t.Fatalf("zero-dest scalar RecvScan: expect ErrTypeMismatch, got %v", err)
+	}
+	if err := c.RecvScan(name); err != ErrInvalidArgType {
+		t.Fatalf("non-pointer RecvScan: expect ErrInvalidArgType, got %v", err)
+	}
+
+	// Empty RedisErr does not pin read buffer.
+	pinBeforeEmpty := c.br.pin
+	if err := c.RecvScan(&s); err == nil || err.Error() != "" {
+		t.Fatalf("empty RedisErr: got %v", err)
+	}
+	if c.br.pin != pinBeforeEmpty {
+		t.Fatalf("empty RedisErr unexpectedly pinned buffer: before=%d after=%d", pinBeforeEmpty, c.br.pin)
+	}
+
+	// Top-level and nested RedisErrs must pin the read buffer.
+	topErr := c.RecvScan(&s)
+	if re, ok := topErr.(RedisErr); !ok || re.Error() != "ERR top-level" {
+		t.Fatalf("top RedisErr: got %v", topErr)
+	}
+	var okStr string
+	nestedSkipErr := c.RecvScan(&okStr, nil)
+	if re, ok := nestedSkipErr.(RedisErr); !ok || re.Error() != "ERR nested-elem" || okStr != "OK" {
+		t.Fatalf("nested skip RedisErr: got %q %v", okStr, nestedSkipErr)
+	}
+	var v1, v2 string
+	nestedTypedErr := c.RecvScan(&v1, &v2)
+	if re, ok := nestedTypedErr.(RedisErr); !ok || re.Error() != "ERR nested-typed" || v1 != "v1" {
+		t.Fatalf("nested typed RedisErr: got %q %v", v1, nestedTypedErr)
+	}
+	var deepSS []string
+	deepNestedErr := c.RecvScan(&deepSS, &okStr)
+	if re, ok := deepNestedErr.(RedisErr); !ok || re.Error() != "ERR deep-nested" {
+		t.Fatalf("2-level nested RedisErr: got %v %v", deepSS, deepNestedErr)
+	}
+
+	// Churn 4KB+ of replies through the connection to force buffer reuse/growth.
+	for range 64 {
+		var p string
+		if err := c.RecvScan(&p); err != nil || len(p) != 64 {
+			t.Fatalf("churn RecvScan: len=%d err=%v", len(p), err)
+		}
+	}
+	if done, err := c.RecvString(); err != nil || done != "DONE" {
+		t.Fatalf("stream out of sync after RecvScan errors: got %q %v", done, err)
+	}
+	if c.Err() != nil {
+		t.Fatalf("non-fatal RecvScan errors broke conn: %v", c.Err())
+	}
+
+	// Earlier scanned values and returned errors must remain uncorrupted.
+	if name != "alice" || string(raw) != "raw" || string(bb[0]) != "a" || string(bb[1]) != "b" || sm["f"] != "v" {
+		t.Fatalf("earlier RecvScan values corrupted: %q %q %q %q %v", name, raw, bb[0], bb[1], sm)
+	}
+	if numErr.Error() != numErrWant || topErr.Error() != "ERR top-level" ||
+		nestedSkipErr.Error() != "ERR nested-elem" || nestedTypedErr.Error() != "ERR nested-typed" ||
+		deepNestedErr.Error() != "ERR deep-nested" {
+		t.Fatalf("earlier errors corrupted: %q %q %q %q %q", numErr, topErr, nestedSkipErr, nestedTypedErr, deepNestedErr)
+	}
+
+	// 3. Fatal I/O error closes conn and leaves destination untouched.
+	eofConn := newTestConn("", 0)
+	dst := int64(777)
+	if err := eofConn.RecvScan(&dst); err != io.EOF {
+		t.Fatalf("expect io.EOF, got %v", err)
+	}
+	if dst != 777 || eofConn.Err() != io.EOF {
+		t.Fatalf("fatal RecvScan state: dst=%d err=%v", dst, eofConn.Err())
+	}
+
+	// 4. Stack-backed *[]byte: fits in cap (reuses), empty ($0 preserves backing),
+	// and exceeds cap (allocates fresh slice without mutating stack array).
+	cStack := newTestConn(tstr("hi")+`$0`+"\r\n\r\n"+tstr("0123456789abcdef"), 0)
+	var arr [8]byte
+	sb := arr[:0]
+	if err := cStack.RecvScan(&sb); err != nil || string(sb) != "hi" || &sb[0] != &arr[0] {
+		t.Fatalf("stack *[]byte fit: %q %v", sb, err)
+	}
+	if err := cStack.RecvScan(&sb); err != nil || sb == nil || len(sb) != 0 || cap(sb) != len(arr) {
+		t.Fatalf("stack *[]byte empty: len=%d cap=%d err=%v", len(sb), cap(sb), err)
+	}
+	if err := cStack.RecvScan(&sb); err != nil || string(sb) != "0123456789abcdef" || &sb[0] == &arr[0] {
+		t.Fatalf("stack *[]byte grow: %q %v", sb, err)
+	}
+	if string(arr[:2]) != "hi" {
+		t.Fatalf("stack array unexpectedly mutated after grow: %q", arr[:2])
+	}
+
+	// 5. Oversized (>64KB) bulk and >maxArrayPrealloc (1200-elem) array replies
+	// release read buffer and scratch reply array after RecvScan.
+	bigVal := strings.Repeat("Z", maxReuseBuf+1024)
+	cBig1 := newTestConn(tcmd(tstr(bigVal), ":7\r\n"), 0)
+	var gotBig string
+	var gotN int
+	if err := cBig1.RecvScan(&gotBig, &gotN); err != nil || gotBig != bigVal || gotN != 7 {
+		t.Fatalf("oversized RecvScan: len=%d n=%d err=%v", len(gotBig), gotN, err)
+	}
+	if cBig1.br.b != nil {
+		t.Fatalf("oversized read buffer not dropped after RecvScan: len=%d", len(cBig1.br.b))
+	}
+
+	elems := make([]string, maxArrayPrealloc+176)
+	for i := range elems {
+		elems[i] = tstr("e" + strconv.Itoa(i))
+	}
+	cBig2 := newTestConn(tcmd(elems...)+"+OK\r\n", 0)
+	var firstElem, secondElem string
+	if err := cBig2.RecvScan(&firstElem, &secondElem); err != nil || firstElem != "e0" || secondElem != "e1" {
+		t.Fatalf("large array partial RecvScan: %q %q %v", firstElem, secondElem, err)
+	}
+	if cap(cBig2.reply.array) != 0 {
+		t.Fatalf("scratch reply array >maxArrayPrealloc not trimmed: cap=%d", cap(cBig2.reply.array))
+	}
+	if okStr, err := cBig2.RecvString(); err != nil || okStr != "OK" {
+		t.Fatalf("post-oversized RecvString: %q %v", okStr, err)
 	}
 }

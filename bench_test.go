@@ -341,6 +341,61 @@ func BenchmarkReplyScanStrings(b *testing.B) {
 	}
 }
 
+func BenchmarkRecvScan(b *testing.B) {
+	b.ReportAllocs()
+	c := benchConn(tcmd(":42\r\n", tstr("12.5"), ":1\r\n", tstr("token")))
+	raw := make([]byte, 0, 16)
+	for b.Loop() {
+		var n int64
+		var f float64
+		var ok bool
+		if err := c.Send("HMGET", "k", "n", "f", "ok", "tok"); err != nil {
+			b.Fatal(err)
+		}
+		if err := c.RecvScan(&n, &f, &ok, &raw); err != nil {
+			b.Fatal(err)
+		}
+	}
+}
+
+func BenchmarkRecvScanStrings(b *testing.B) {
+	b.ReportAllocs()
+	c := benchConn(tcmd(tstr("alice"), tstr("alice@example.com"), tstr("admin"), tstr("us-west"), tstr("active")))
+	for b.Loop() {
+		var s1, s2, s3, s4, s5 string
+		if err := c.Send("HMGET", "user:1", "name", "email", "role", "region", "status"); err != nil {
+			b.Fatal(err)
+		}
+		if err := c.RecvScan(&s1, &s2, &s3, &s4, &s5); err != nil {
+			b.Fatal(err)
+		}
+	}
+}
+
+func BenchmarkPoolPipelineRecvScan(b *testing.B) {
+	b.ReportAllocs()
+	p := NewPool(func(ctx context.Context) (*Conn, error) {
+		return benchConn("+OK\r\n" + tcmd(":42\r\n", tstr("12.5"), ":1\r\n")), nil
+	})
+	ctx := context.Background()
+	for b.Loop() {
+		var n int64
+		var f float64
+		var ok bool
+		err := p.Pipeline(ctx, func(pipe *Pipeline) error {
+			pipe.Send("SET", "k", "v")
+			pipe.Send("HMGET", "h", "n", "f", "ok")
+			if err := pipe.RecvNoReply(); err != nil {
+				return err
+			}
+			return pipe.RecvScan(&n, &f, &ok)
+		})
+		if err != nil {
+			b.Fatal(err)
+		}
+	}
+}
+
 func BenchmarkNewConn(b *testing.B) {
 	b.ReportAllocs()
 	fc := &FakeConn{}

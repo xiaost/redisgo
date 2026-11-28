@@ -958,6 +958,19 @@ func (c *Conn) RecvInt64Map() (map[string]int64, error) {
 	return v, err
 }
 
+// RecvScan receives the next reply and unpacks it into dest using Reply.Scan.
+// Unlike Recv, it reuses the scratch reply and read buffer of c; byte slices
+// scanned into *[]byte and *[][]byte are copied and safe to retain.
+func (c *Conn) RecvScan(dest ...any) error {
+	r, err := c.recvScratch()
+	if err != nil {
+		return err
+	}
+	err = r.Scan(dest...)
+	c.done(false, err)
+	return err
+}
+
 // Session states set by commands. A Pool closes a conn in any of them
 // instead of handing it to the next caller.
 const (

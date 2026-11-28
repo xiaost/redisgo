@@ -228,6 +228,15 @@ func (p *Pipeline) RecvInt64Map() (map[string]int64, error) {
 	return p.c.RecvInt64Map()
 }
 
+// RecvScan receives the next reply and unpacks it into dest using Reply.Scan.
+// Byte slices scanned into *[]byte and *[][]byte are copied and safe to retain.
+func (p *Pipeline) RecvScan(dest ...any) error {
+	if err := p.prepareRecv(); err != nil {
+		return err
+	}
+	return p.c.RecvScan(dest...)
+}
+
 // Drain flushes and receives all unread replies sent through this Pipeline.
 // If any Send or Flush failed, Drain still consumes replies for the commands
 // already sent so the connection stays in sync, then returns the Send/Flush

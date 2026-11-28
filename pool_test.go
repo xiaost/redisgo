@@ -1141,7 +1141,14 @@ func TestPoolNewDoHelpersAndClosedPoolConn(t *testing.T) {
 	if _, err := pc.RecvString(); err != ErrClosed {
 		t.Fatal(err)
 	}
+	var scanned string
+	if err := pc.RecvScan(&scanned); err != ErrClosed {
+		t.Fatal(err)
+	}
 	pipe := pc.Pipeline()
+	if err := pipe.RecvScan(&scanned); err != ErrClosed {
+		t.Fatal(err)
+	}
 	pipe.Send("PING")
 	if pipe.Err() != ErrClosed {
 		t.Fatal(pipe.Err())
