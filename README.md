@@ -107,9 +107,26 @@ err = pool.DoNoReply(ctx, "HSET", "user:1", map[string]any{
 user, err := pool.DoStringMap(ctx, "HGETALL", "user:1")
 ```
 
-### Unpacking Mixed Replies with `Reply.Scan`
+### Unpacking Mixed Replies with `RecvScan` & `Reply.Scan`
 
-Use `Reply.Scan` for heterogeneous arrays like `MGET`, `HMGET`, or `EXEC`:
+Use `Pipeline.RecvScan` or `Conn.RecvScan` to unpack heterogeneous arrays like `MGET`, `HMGET`, `BLPOP`, or `EXEC` directly from the connection's scratch reply (no `Reply` pool round-trip, read buffer reused):
+
+```go
+var (
+    name    string
+    age     int
+    missing string // nil elements reset to zero value
+)
+err := pool.Pipeline(ctx, func(p *redisgo.Pipeline) error {
+    p.Send("HMGET", "user:1", "name", "age", "missing")
+    return p.RecvScan(&name, &age, &missing)
+})
+if err != nil {
+    log.Fatal(err)
+}
+```
+
+When working with a raw `*Reply` from `Do` or `Recv`, call `Reply.Scan` with the same destinations:
 
 ```go
 r, err := pool.Do(ctx, "HMGET", "user:1", "name", "age", "missing")
@@ -118,17 +135,12 @@ if err != nil {
 }
 defer r.Free()
 
-var (
-    name    string
-    age     int
-    missing string // nil elements reset to zero value
-)
 if err := r.Scan(&name, &age, &missing); err != nil {
     log.Fatal(err)
 }
 ```
 
-Pass `nil` to skip an element (`r.Scan(&name, nil, &missing)`). Byte slices scanned into `*[]byte` or `*[][]byte` are copied and safe to retain.
+Pass `nil` to skip an element (`p.RecvScan(&name, nil, &missing)`). Byte slices scanned into `*[]byte` or `*[][]byte` are copied and safe to retain (a pre-allocated `*[]byte` reuses its backing capacity with 0 allocs).
 
 ## Pipelining & Transactions
 
@@ -268,10 +280,12 @@ for {
 | API | Read Buffer | Notes |
 | --- | --- | --- |
 | `DoNoReply`, `DoOK`, `DoInteger`, `DoInt`, `DoInt64`, `DoUint64`, `DoFloat64`, `DoBool` | **Reused** (up to 64KB) | **0 allocs** on valid replies; safe to reuse conn immediately |
-| `DoString`, `DoStrings`, `DoInt64s`, `DoFloat64s`, `DoBools`, `DoStringMap`, `DoInt64Map`, `DoScan` | **Reused** (up to 64KB) | Copies/parses result; `Strings` / maps pack small string payloads (`<= 4KB`) into 1 buffer |
-| `RecvNoReply`, `RecvOK`, `RecvString`, `RecvInt64`, `RecvStrings`, `RecvStringMap`, ... (`Conn` & `Pipeline`) | **Reused** (up to 64KB) | Same as `DoXxx` for pipelines without `Reply` pool round-trips |
-| `DoBytes`, `DoBytesSlice`, `RecvBytes`, `RecvBytesSlice` | **Exposed (pinned)** | **Zero-copy** slice aliasing the read buffer; copy before long-term retention |
-| `Do` + `Reply.Free`, `Send` + `Recv` | **Exposed (pinned)** | Full control over raw RESP replies; always call `Reply.Free()` once |
+| `DoString`, `DoStrings`, `DoInt64s`, `DoFloat64s`, `DoBools`, `DoStringMap`, `DoInt64Map`, `DoScan`, `Scan` | **Reused** (up to 64KB) | Copies/parses result; `Strings`, maps, and `Scan` pack small elements (`<= 2KB`) into `<= 4KB` chunks (`+OK`/`+PONG`/`+QUEUED` and `<= 1B` strings allocate 0); `Scan` reuses its page slice |
+| `RecvNoReply`, `RecvOK`, `RecvString`, `RecvInt64`, `RecvStrings`, `RecvStringMap`, `RecvScan`, ... (`Conn` & `Pipeline`) | **Reused** (up to 64KB, compacted in-place) | Same as `DoXxx` for pipelines without `Reply` pool round-trips; `RecvScan` achieves **0 allocs** for numeric/bool/reused-`*[]byte` destinations and packs multiple `*string` destinations and `*[][]byte` elements (`<= 2KB`) into `<= 4KB` chunks |
+| `DoBytes`, `DoBytesSlice`, `RecvBytes`, `RecvBytesSlice` | **Exposed only if non-empty** | **Zero-copy** slice aliasing the read buffer (copy before long-term retention); `nil` and empty (`$0`) replies do not pin the buffer |
+| `Do` + `Reply.Free`, `Send` + `Recv` | **Exposed only if aliasing** | Full control over raw RESP replies; non-aliasing replies (integers, `nil`, empty strings/arrays) do not pin the read buffer; always call `Reply.Free()` once |
+
+Large commands (`> 64KB`) stream through a pooled 64KB chunk buffer without growing per-connection command buffers, and deep pipelines compact unread bytes in-place so replies straddling the read buffer boundary do not trigger buffer reallocations.
 
 ## Error Handling & Notes
 
